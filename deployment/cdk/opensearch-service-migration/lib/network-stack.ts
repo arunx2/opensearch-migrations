@@ -1,4 +1,6 @@
 import {
+    GatewayVpcEndpointAwsService,
+    InterfaceVpcEndpointAwsService,
     IpAddresses, IVpc, Port, SecurityGroup,
     SubnetType,
     Vpc
@@ -11,8 +13,10 @@ import { ARecord, HostedZone, RecordTarget } from "aws-cdk-lib/aws-route53";
 import { LoadBalancerTarget } from "aws-cdk-lib/aws-route53-targets";
 import { AcmCertificateImporter } from "./service-stacks/acm-cert-importer";
 import { Stack } from "aws-cdk-lib";
-import { createMigrationStringParameter, getMigrationStringParameterName, MigrationSSMParameter } from "./common-utilities";
+import { createMigrationStringParameter, getMigrationStringParameterName, isStackInGovCloud, MigrationSSMParameter } from "./common-utilities";
 import { StringParameter } from "aws-cdk-lib/aws-ssm";
+import { GatewayVpcEndpoint, InterfaceVpcEndpoint } from "aws-cdk-lib/aws-ec2";
+import { CdkLogger } from "./cdk-logger";
 
 export interface NetworkStackProps extends StackPropsExt {
     readonly vpcId?: string;
@@ -28,7 +32,8 @@ export interface NetworkStackProps extends StackPropsExt {
     readonly targetClusterUsername?: string;
     readonly targetClusterPasswordSecretArn?: string;
     readonly albAcmCertArn?: string;
-    readonly env?: { [key: string]: any };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    readonly env?: Record<string, any>;
 }
 
 export class NetworkStack extends Stack {
@@ -36,34 +41,6 @@ export class NetworkStack extends Stack {
     public readonly albSourceProxyTG: IApplicationTargetGroup;
     public readonly albTargetProxyTG: IApplicationTargetGroup;
     public readonly albSourceClusterTG: IApplicationTargetGroup;
-    public readonly albMigrationConsoleTG: IApplicationTargetGroup;
-
-    // Validate a proper url string is provided and return an url string which contains a protocol, host name, and port.
-    // If a port is not provided, the default protocol port (e.g. 443, 80) will be explicitly added
-    static validateAndReturnFormattedHttpURL(urlString: string) {
-        // URL will throw error if the urlString is invalid
-        let url = new URL(urlString);
-        if (url.protocol !== "http:" && url.protocol !== "https:") {
-            throw new Error(`Invalid url protocol for target endpoint: ${urlString} was expecting 'http' or 'https'`)
-        }
-        if (url.pathname !== "/") {
-            throw new Error(`Provided target endpoint: ${urlString} must not contain a path: ${url.pathname}`)
-        }
-        // URLs that contain the default protocol port (e.g. 443, 80) will not show in the URL toString()
-        let formattedUrlString = url.toString()
-        if (formattedUrlString.endsWith("/")) {
-            formattedUrlString = formattedUrlString.slice(0, -1)
-        }
-        if (!url.port) {
-            if (url.protocol === "http:") {
-                formattedUrlString = formattedUrlString.concat(":80")
-            }
-            else {
-                formattedUrlString = formattedUrlString.concat(":443")
-            }
-        }
-        return formattedUrlString
-    }
 
     private validateVPC(vpc: IVpc) {
         let uniqueAzPrivateSubnets: string[] = []
@@ -73,10 +50,47 @@ export class NetworkStack extends Stack {
                 onePerAz: true
             }).subnetIds
         }
-        console.info(`Detected VPC with ${vpc.privateSubnets.length} private subnets, ${vpc.publicSubnets.length} public subnets, and ${vpc.isolatedSubnets.length} isolated subnets`)
+        CdkLogger.info(`Detected VPC with ${vpc.privateSubnets.length} private subnets, ${vpc.publicSubnets.length} public subnets, and ${vpc.isolatedSubnets.length} isolated subnets`)
         if (uniqueAzPrivateSubnets.length < 2) {
             throw new Error(`Not enough AZs (${uniqueAzPrivateSubnets.length} unique AZs detected) used for private subnets to meet 2 or 3 AZ requirement`)
         }
+    }
+
+    private createVpcEndpoints(vpc: IVpc) {
+        // Gateway endpoints
+        new GatewayVpcEndpoint(this, 'S3VpcEndpoint', {
+            service: GatewayVpcEndpointAwsService.S3,
+            vpc: vpc,
+        });
+
+        // Interface endpoints
+        const createInterfaceVpcEndpoint = (service: InterfaceVpcEndpointAwsService) => {
+            new InterfaceVpcEndpoint(this, `${service.shortName}VpcEndpoint`, {
+                service: service,
+                vpc: vpc,
+            });
+        };
+
+        // General interface endpoints
+        const interfaceEndpoints = [
+            InterfaceVpcEndpointAwsService.CLOUDWATCH_LOGS, // Push Logs from tasks
+            InterfaceVpcEndpointAwsService.CLOUDWATCH_MONITORING, // Pull Metrics from Migration Console
+            InterfaceVpcEndpointAwsService.ECR_DOCKER, // Pull Images on Startup
+            InterfaceVpcEndpointAwsService.ECR, // List Images on Startup
+            InterfaceVpcEndpointAwsService.ECS_AGENT, // Task Container Metrics
+            InterfaceVpcEndpointAwsService.ECS_TELEMETRY, // Task Container Metrics
+            InterfaceVpcEndpointAwsService.ECS, // ECS Task Control
+            InterfaceVpcEndpointAwsService.ELASTIC_LOAD_BALANCING, // Control ALB
+            InterfaceVpcEndpointAwsService.SECRETS_MANAGER, // Cluster Password Secret
+            InterfaceVpcEndpointAwsService.SSM_MESSAGES, // Session Manager
+            InterfaceVpcEndpointAwsService.SSM, // Parameter Store
+            InterfaceVpcEndpointAwsService.XRAY, // X-Ray Traces
+            isStackInGovCloud(this) ?
+                InterfaceVpcEndpointAwsService.ELASTIC_FILESYSTEM_FIPS : // EFS Control Plane GovCloud
+                InterfaceVpcEndpointAwsService.ELASTIC_FILESYSTEM, // EFS Control Plane
+
+        ];
+        interfaceEndpoints.forEach(service => createInterfaceVpcEndpoint(service));
     }
 
     constructor(scope: Construct, id: string, props: NetworkStackProps) {
@@ -111,7 +125,7 @@ export class NetworkStack extends Stack {
             this.vpc = new Vpc(this, 'domainVPC', {
                 // IP space should be customized for use cases that have specific IP range needs
                 ipAddresses: IpAddresses.cidr('10.0.0.0/16'),
-                maxAzs: zoneCount ? zoneCount : 2,
+                maxAzs: zoneCount ?? 2,
                 subnetConfiguration: [
                     // Outbound internet access for private subnets require a NAT Gateway which must live in
                     // a public subnet
@@ -127,7 +141,10 @@ export class NetworkStack extends Stack {
                         cidrMask: 24,
                     },
                 ],
+                natGateways: 0,
             });
+            // Only create interface endpoints if VPC not imported
+            this.createVpcEndpoints(this.vpc);
         }
         this.validateVPC(this.vpc)
         if(!props.addOnMigrationDeployId) {
@@ -139,7 +156,6 @@ export class NetworkStack extends Stack {
 
         const needAlb = props.captureProxyServiceEnabled ||
             props.elasticsearchServiceEnabled ||
-            props.migrationAPIEnabled ||
             props.captureProxyESServiceEnabled ||
             props.targetClusterProxyServiceEnabled;
 
@@ -191,14 +207,6 @@ export class NetworkStack extends Stack {
                 createALBListenerUrlParameter(9999, MigrationSSMParameter.SOURCE_CLUSTER_ENDPOINT);
             }
 
-            // Setup when deploying migration console api on ecs
-            if (props.migrationAPIEnabled) {
-                this.albMigrationConsoleTG = this.createSecureTargetGroup('ALBMigrationConsole', props.stage, 8000, this.vpc);
-                this.createSecureListener('MigrationConsole', 8000, alb, cert, this.albMigrationConsoleTG);
-                createALBListenerUrlParameter(8000, MigrationSSMParameter.MIGRATION_API_URL);
-                createALBListenerUrlParameterAlias(8000, MigrationSSMParameter.MIGRATION_API_URL_ALIAS);
-            }
-
             // Setup when deploying capture proxy in ECS
             if (props.captureProxyServiceEnabled || props.captureProxyESServiceEnabled) {
                 this.albSourceProxyTG = this.createSecureTargetGroup('ALBSourceProxy', props.stage, 9200, this.vpc);
@@ -244,6 +252,7 @@ export class NetworkStack extends Stack {
             const defaultSecurityGroup = new SecurityGroup(this, 'osClusterAccessSG', {
                 vpc: this.vpc,
                 allowAllOutbound: false,
+                allowAllIpv6Outbound: false,
             });
             defaultSecurityGroup.addIngressRule(defaultSecurityGroup, Port.allTraffic());
 
@@ -253,9 +262,8 @@ export class NetworkStack extends Stack {
             });
 
             if (props.targetClusterEndpoint) {
-                const formattedClusterEndpoint = NetworkStack.validateAndReturnFormattedHttpURL(props.targetClusterEndpoint);
                 const deployId = props.addOnMigrationDeployId ? props.addOnMigrationDeployId : props.defaultDeployId;
-                createMigrationStringParameter(this, formattedClusterEndpoint, {
+                createMigrationStringParameter(this, props.targetClusterEndpoint, {
                     stage: props.stage,
                     defaultDeployId: deployId,
                     parameter: MigrationSSMParameter.OS_CLUSTER_ENDPOINT
@@ -276,7 +284,7 @@ export class NetworkStack extends Stack {
     }
 
     getSecureListenerSslPolicy() {
-        return (this.partition === "aws-us-gov") ? SslPolicy.FIPS_TLS13_12_EXT2 : SslPolicy.RECOMMENDED_TLS
+        return isStackInGovCloud(this) ? SslPolicy.FIPS_TLS13_12_EXT2 : SslPolicy.RECOMMENDED_TLS
     }
 
     createSecureListener(serviceName: string, listeningPort: number, alb: IApplicationLoadBalancer, cert: ICertificate, albTargetGroup?: IApplicationTargetGroup) {

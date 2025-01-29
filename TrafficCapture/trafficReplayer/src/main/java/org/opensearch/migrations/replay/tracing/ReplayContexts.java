@@ -4,14 +4,6 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Optional;
 
-import io.opentelemetry.api.common.AttributeKey;
-import io.opentelemetry.api.common.Attributes;
-import io.opentelemetry.api.common.AttributesBuilder;
-import io.opentelemetry.api.metrics.DoubleHistogram;
-import io.opentelemetry.api.metrics.LongCounter;
-import io.opentelemetry.api.metrics.LongUpDownCounter;
-import io.opentelemetry.api.metrics.Meter;
-
 import org.opensearch.migrations.replay.datatypes.ISourceTrafficChannelKey;
 import org.opensearch.migrations.replay.datatypes.ITrafficStreamKey;
 import org.opensearch.migrations.replay.datatypes.UniqueReplayerRequestKey;
@@ -20,18 +12,23 @@ import org.opensearch.migrations.tracing.CommonScopedMetricInstruments;
 import org.opensearch.migrations.tracing.DirectNestedSpanContext;
 import org.opensearch.migrations.tracing.IScopedInstrumentationAttributes;
 
+import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.api.common.AttributesBuilder;
+import io.opentelemetry.api.metrics.DoubleHistogram;
+import io.opentelemetry.api.metrics.LongCounter;
+import io.opentelemetry.api.metrics.LongUpDownCounter;
+import io.opentelemetry.api.metrics.Meter;
 import lombok.Getter;
 import lombok.NonNull;
 import lombok.Setter;
-import lombok.extern.slf4j.Slf4j;
 
-@Slf4j
-public abstract class ReplayContexts extends IReplayContexts {
+public interface ReplayContexts extends IReplayContexts {
 
-    public static final String COUNT_UNIT_STR = "count";
-    public static final String BYTES_UNIT_STR = "bytes";
+    String COUNT_UNIT_STR = "count";
+    String BYTES_UNIT_STR = "bytes";
 
-    public static class SocketContext extends DirectNestedSpanContext<
+    class SocketContext extends DirectNestedSpanContext<
         RootReplayerContext,
         ChannelKeyContext,
         IChannelKeyContext> implements ISocketContext {
@@ -74,7 +71,7 @@ public abstract class ReplayContexts extends IReplayContexts {
         }
     }
 
-    public static class ChannelKeyContext extends BaseNestedSpanContext<
+    class ChannelKeyContext extends BaseNestedSpanContext<
         RootReplayerContext,
         IScopedInstrumentationAttributes> implements IReplayContexts.IChannelKeyContext {
         @Getter
@@ -100,13 +97,13 @@ public abstract class ReplayContexts extends IReplayContexts {
 
         public static class MetricInstruments extends CommonScopedMetricInstruments {
             final LongUpDownCounter activeChannelCounter;
-            final LongCounter failedConnectionAttempts;
+            final LongCounter unretryableConnectionFailures;
 
             private MetricInstruments(Meter meter, String activityName) {
                 super(meter, activityName);
                 activeChannelCounter = meter.upDownCounterBuilder(MetricNames.ACTIVE_CHANNELS_YET_TO_BE_FULLY_DISCARDED)
                     .build();
-                failedConnectionAttempts = meter.counterBuilder(MetricNames.FAILED_CONNECTION_ATTEMPTS).build();
+                unretryableConnectionFailures = meter.counterBuilder(MetricNames.NONRETRYABLE_CONNECTION_FAILURES).build();
             }
         }
 
@@ -131,11 +128,11 @@ public abstract class ReplayContexts extends IReplayContexts {
 
         @Override
         public void addFailedChannelCreation() {
-            meterIncrementEvent(getMetrics().failedConnectionAttempts);
+            meterIncrementEvent(getMetrics().unretryableConnectionFailures);
         }
     }
 
-    public static class KafkaRecordContext extends BaseNestedSpanContext<RootReplayerContext, IChannelKeyContext>
+    class KafkaRecordContext extends BaseNestedSpanContext<RootReplayerContext, IChannelKeyContext>
         implements
             IReplayContexts.IKafkaRecordContext {
 
@@ -189,7 +186,7 @@ public abstract class ReplayContexts extends IReplayContexts {
         }
     }
 
-    public static class TrafficStreamLifecycleContext extends BaseNestedSpanContext<
+    class TrafficStreamLifecycleContext extends BaseNestedSpanContext<
         RootReplayerContext,
         IScopedInstrumentationAttributes> implements IReplayContexts.ITrafficStreamsLifecycleContext {
         private final ITrafficStreamKey trafficStreamKey;
@@ -255,12 +252,13 @@ public abstract class ReplayContexts extends IReplayContexts {
         }
     }
 
-    public static class HttpTransactionContext extends BaseNestedSpanContext<
+    class HttpTransactionContext extends BaseNestedSpanContext<
         RootReplayerContext,
         IReplayContexts.ITrafficStreamsLifecycleContext> implements IReplayContexts.IReplayerHttpTransactionContext {
         final UniqueReplayerRequestKey replayerRequestKey;
         @Getter
         final Instant timeOfOriginalRequest;
+        int numTransactionContextsCreated;
 
         public HttpTransactionContext(
             RootReplayerContext rootScope,
@@ -274,15 +272,14 @@ public abstract class ReplayContexts extends IReplayContexts {
             initializeSpan();
         }
 
-        @Override
-        public IReplayContexts.ITupleHandlingContext createTupleContext() {
-            return new ReplayContexts.TupleHandlingContext(this);
-        }
-
         public static class MetricInstruments extends CommonScopedMetricInstruments {
+            final LongCounter numRetries;
+
             private MetricInstruments(Meter meter, String activityName) {
                 super(meter, activityName);
+                numRetries = meter.counterBuilder(MetricNames.NUM_REQUEST_RETRIES).setUnit(COUNT_UNIT_STR).build();
             }
+
         }
 
         public static @NonNull MetricInstruments makeMetrics(Meter meter) {
@@ -295,30 +292,6 @@ public abstract class ReplayContexts extends IReplayContexts {
 
         public IReplayContexts.IChannelKeyContext getChannelKeyContext() {
             return getLogicalEnclosingScope();
-        }
-
-        @Override
-        public RequestTransformationContext createTransformationContext() {
-            return new ReplayContexts.RequestTransformationContext(this);
-        }
-
-        public IReplayContexts.IRequestAccumulationContext createRequestAccumulationContext() {
-            return new ReplayContexts.RequestAccumulationContext(this);
-        }
-
-        @Override
-        public IReplayContexts.IResponseAccumulationContext createResponseAccumulationContext() {
-            return new ReplayContexts.ResponseAccumulationContext(this);
-        }
-
-        @Override
-        public TargetRequestContext createTargetRequestContext() {
-            return new ReplayContexts.TargetRequestContext(this);
-        }
-
-        @Override
-        public IReplayContexts.IScheduledContext createScheduledContext(Instant timestamp) {
-            return new ReplayContexts.ScheduledContext(this, Duration.between(Instant.now(), timestamp).toNanos());
         }
 
         @Override
@@ -335,9 +308,43 @@ public abstract class ReplayContexts extends IReplayContexts {
         public IReplayContexts.IChannelKeyContext getLogicalEnclosingScope() {
             return getImmediateEnclosingScope().getLogicalEnclosingScope();
         }
+
+        @Override
+        public IReplayContexts.IRequestAccumulationContext createRequestAccumulationContext() {
+            return new ReplayContexts.RequestAccumulationContext(this);
+        }
+
+        @Override
+        public IReplayContexts.IResponseAccumulationContext createResponseAccumulationContext() {
+            return new ReplayContexts.ResponseAccumulationContext(this);
+        }
+
+        @Override
+        public RequestTransformationContext createTransformationContext() {
+            return new ReplayContexts.RequestTransformationContext(this);
+        }
+
+        @Override
+        public TargetRequestContext createTargetRequestContext() {
+            if (numTransactionContextsCreated > 0) {
+                meterIncrementEvent(getMetrics().numRetries);
+            }
+            ++numTransactionContextsCreated;
+            return new ReplayContexts.TargetRequestContext(this);
+        }
+
+        @Override
+        public IReplayContexts.IScheduledContext createScheduledContext(Instant timestamp) {
+            return new ReplayContexts.ScheduledContext(this, Duration.between(Instant.now(), timestamp).toNanos());
+        }
+
+        @Override
+        public IReplayContexts.ITupleHandlingContext createTupleContext() {
+            return new ReplayContexts.TupleHandlingContext(this);
+        }
     }
 
-    public static class RequestAccumulationContext extends DirectNestedSpanContext<
+    class RequestAccumulationContext extends DirectNestedSpanContext<
         RootReplayerContext,
         HttpTransactionContext,
         IReplayContexts.IReplayerHttpTransactionContext> implements IReplayContexts.IRequestAccumulationContext {
@@ -361,7 +368,7 @@ public abstract class ReplayContexts extends IReplayContexts {
         }
     }
 
-    public static class ResponseAccumulationContext extends DirectNestedSpanContext<
+    class ResponseAccumulationContext extends DirectNestedSpanContext<
         RootReplayerContext,
         HttpTransactionContext,
         IReplayContexts.IReplayerHttpTransactionContext> implements IReplayContexts.IResponseAccumulationContext {
@@ -385,7 +392,7 @@ public abstract class ReplayContexts extends IReplayContexts {
         }
     }
 
-    public static class RequestTransformationContext extends DirectNestedSpanContext<
+    class RequestTransformationContext extends DirectNestedSpanContext<
         RootReplayerContext,
         HttpTransactionContext,
         IReplayContexts.IReplayerHttpTransactionContext> implements IReplayContexts.IRequestTransformationContext {
@@ -400,6 +407,9 @@ public abstract class ReplayContexts extends IReplayContexts {
             private final LongCounter payloadSuccessParses;
             private final LongCounter jsonPayloadParses;
             private final LongCounter jsonTransformSuccess;
+            private final LongCounter textParseSuccess;
+            private final LongCounter textParseFailed;
+            private final LongCounter payloadTransformBinary;
             private final LongCounter payloadBytesIn;
             private final LongCounter uncompressedBytesIn;
             private final LongCounter uncompressedBytesOut;
@@ -425,6 +435,15 @@ public abstract class ReplayContexts extends IReplayContexts {
                     .setUnit(COUNT_UNIT_STR)
                     .build();
                 jsonTransformSuccess = meter.counterBuilder(MetricNames.TRANSFORM_JSON_SUCCEEDED)
+                    .setUnit(COUNT_UNIT_STR)
+                    .build();
+                textParseSuccess = meter.counterBuilder(MetricNames.TRANSFORM_TEXT_SUCCEEDED)
+                    .setUnit(COUNT_UNIT_STR)
+                    .build();
+                textParseFailed = meter.counterBuilder(MetricNames.TRANSFORM_TEXT_FAILED)
+                    .setUnit(COUNT_UNIT_STR)
+                    .build();
+                payloadTransformBinary = meter.counterBuilder(MetricNames.TRANSFORM_PAYLOAD_BINARY)
                     .setUnit(COUNT_UNIT_STR)
                     .build();
                 payloadBytesIn = meter.counterBuilder(MetricNames.TRANSFORM_PAYLOAD_BYTES_IN)
@@ -490,6 +509,21 @@ public abstract class ReplayContexts extends IReplayContexts {
         }
 
         @Override
+        public void onTextPayloadParseSucceeded() {
+            meterIncrementEvent(getMetrics().textParseSuccess);
+        }
+
+        @Override
+        public void onTextPayloadParseFailed() {
+            meterIncrementEvent(getMetrics().textParseFailed);
+        }
+
+        @Override
+        public void onPayloadSetBinary() {
+            meterIncrementEvent(getMetrics().payloadTransformBinary);
+        }
+
+        @Override
         public void onPayloadBytesIn(int inputSize) {
             meterIncrementEvent(getMetrics().payloadBytesIn, inputSize);
         }
@@ -537,7 +571,7 @@ public abstract class ReplayContexts extends IReplayContexts {
         }
     }
 
-    public static class ScheduledContext extends DirectNestedSpanContext<
+    class ScheduledContext extends DirectNestedSpanContext<
         RootReplayerContext,
         HttpTransactionContext,
         IReplayContexts.IReplayerHttpTransactionContext> implements IReplayContexts.IScheduledContext {
@@ -576,7 +610,7 @@ public abstract class ReplayContexts extends IReplayContexts {
         }
     }
 
-    public static class TargetRequestContext extends DirectNestedSpanContext<
+    class TargetRequestContext extends DirectNestedSpanContext<
         RootReplayerContext,
         HttpTransactionContext,
         IReplayContexts.IReplayerHttpTransactionContext> implements IReplayContexts.ITargetRequestContext {
@@ -626,6 +660,11 @@ public abstract class ReplayContexts extends IReplayContexts {
         }
 
         @Override
+        public IRequestConnectingContext createHttpConnectingContext() {
+            return new ReplayContexts.RequestConnectingContext(this);
+        }
+
+        @Override
         public IRequestSendingContext createHttpSendingContext() {
             return new ReplayContexts.RequestSendingContext(this);
         }
@@ -641,7 +680,31 @@ public abstract class ReplayContexts extends IReplayContexts {
         }
     }
 
-    public static class RequestSendingContext extends DirectNestedSpanContext<
+    class RequestConnectingContext extends DirectNestedSpanContext<
+        RootReplayerContext,
+        TargetRequestContext,
+        IReplayContexts.ITargetRequestContext> implements IReplayContexts.IRequestConnectingContext {
+        public RequestConnectingContext(TargetRequestContext enclosingScope) {
+            super(enclosingScope);
+            initializeSpan();
+        }
+
+        public static class MetricInstruments extends CommonScopedMetricInstruments {
+            private MetricInstruments(Meter meter, String activityName) {
+                super(meter, activityName);
+            }
+        }
+
+        public static @NonNull MetricInstruments makeMetrics(Meter meter) {
+            return new MetricInstruments(meter, ACTIVITY_NAME);
+        }
+
+        public @NonNull MetricInstruments getMetrics() {
+            return getRootInstrumentationScope().requestConnectingInstruments;
+        }
+    }
+
+    class RequestSendingContext extends DirectNestedSpanContext<
         RootReplayerContext,
         TargetRequestContext,
         IReplayContexts.ITargetRequestContext> implements IReplayContexts.IRequestSendingContext {
@@ -665,7 +728,7 @@ public abstract class ReplayContexts extends IReplayContexts {
         }
     }
 
-    public static class WaitingForHttpResponseContext extends DirectNestedSpanContext<
+    class WaitingForHttpResponseContext extends DirectNestedSpanContext<
         RootReplayerContext,
         TargetRequestContext,
         IReplayContexts.ITargetRequestContext> implements IReplayContexts.IWaitingForHttpResponseContext {
@@ -690,7 +753,7 @@ public abstract class ReplayContexts extends IReplayContexts {
 
     }
 
-    public static class ReceivingHttpResponseContext extends DirectNestedSpanContext<
+    class ReceivingHttpResponseContext extends DirectNestedSpanContext<
         RootReplayerContext,
         TargetRequestContext,
         IReplayContexts.ITargetRequestContext> implements IReplayContexts.IReceivingHttpResponseContext {
@@ -717,7 +780,7 @@ public abstract class ReplayContexts extends IReplayContexts {
 
     @Getter
     @Setter
-    public static class TupleHandlingContext extends DirectNestedSpanContext<
+    class TupleHandlingContext extends DirectNestedSpanContext<
         RootReplayerContext,
         HttpTransactionContext,
         IReplayContexts.IReplayerHttpTransactionContext> implements IReplayContexts.ITupleHandlingContext {

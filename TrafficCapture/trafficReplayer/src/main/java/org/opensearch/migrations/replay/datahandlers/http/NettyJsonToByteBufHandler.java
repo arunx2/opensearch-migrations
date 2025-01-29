@@ -43,8 +43,8 @@ public class NettyJsonToByteBufHandler extends ChannelInboundHandlerAdapter {
 
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-        if (msg instanceof HttpJsonMessageWithFaultingPayload) {
-            writeHeadersIntoByteBufs(ctx, (HttpJsonMessageWithFaultingPayload) msg);
+        if (msg instanceof HttpJsonRequestWithFaultingPayload) {
+            writeHeadersIntoByteBufs(ctx, (HttpJsonRequestWithFaultingPayload) msg);
         } else if (msg instanceof ByteBuf) {
             ctx.fireChannelRead(msg);
         } else if (msg instanceof HttpContent) {
@@ -122,7 +122,7 @@ public class NettyJsonToByteBufHandler extends ChannelInboundHandlerAdapter {
      * @param httpJson
      * @throws IOException
      */
-    private void writeHeadersIntoByteBufs(ChannelHandlerContext ctx, HttpJsonMessageWithFaultingPayload httpJson)
+    private void writeHeadersIntoByteBufs(ChannelHandlerContext ctx, HttpJsonRequestWithFaultingPayload httpJson)
         throws IOException {
         var headerChunkSizes = sharedInProgressChunkSizes.get(0);
         try {
@@ -131,9 +131,9 @@ public class NettyJsonToByteBufHandler extends ChannelInboundHandlerAdapter {
                 return;
             }
         } catch (Exception e) {
-            log.atWarn()
-                .setCause(e)
-                .setMessage(() -> "writing headers directly to chunks w/ sizes didn't work for " + httpJson)
+            log.atWarn().setCause(e)
+                .setMessage("writing headers directly to chunks w/ sizes didn't work for {}")
+                .addArgument(httpJson)
                 .log();
         }
 
@@ -145,7 +145,7 @@ public class NettyJsonToByteBufHandler extends ChannelInboundHandlerAdapter {
 
     private static void writeHeadersAsChunks(
         ChannelHandlerContext ctx,
-        HttpJsonMessageWithFaultingPayload httpJson,
+        HttpJsonRequestWithFaultingPayload httpJson,
         List<Integer> headerChunkSizes
     ) throws IOException {
         var initialSize = headerChunkSizes.stream().mapToInt(Integer::intValue).sum();
@@ -177,7 +177,7 @@ public class NettyJsonToByteBufHandler extends ChannelInboundHandlerAdapter {
         }
     }
 
-    private static void writeHeadersIntoStream(HttpJsonMessageWithFaultingPayload httpJson, OutputStream os)
+    private static void writeHeadersIntoStream(HttpJsonRequestWithFaultingPayload httpJson, OutputStream os)
         throws IOException {
         try (var osw = new OutputStreamWriter(os, StandardCharsets.UTF_8)) {
             osw.append(httpJson.method());

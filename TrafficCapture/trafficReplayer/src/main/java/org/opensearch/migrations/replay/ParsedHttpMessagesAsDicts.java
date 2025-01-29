@@ -9,15 +9,22 @@ import java.util.Optional;
 import java.util.concurrent.Callable;
 import java.util.stream.Collectors;
 
-import org.opensearch.migrations.replay.datatypes.TransformedPackets;
+import org.opensearch.migrations.replay.HttpByteBufFormatter.HttpMessageType;
+import org.opensearch.migrations.replay.datahandlers.http.HttpJsonMessageWithFaultingPayload;
+import org.opensearch.migrations.replay.datahandlers.http.HttpJsonRequestWithFaultingPayload;
+import org.opensearch.migrations.replay.datahandlers.http.HttpJsonResponseWithFaultingPayload;
+import org.opensearch.migrations.replay.datahandlers.http.NettyDecodedHttpRequestConvertHandler;
+import org.opensearch.migrations.replay.datahandlers.http.NettyDecodedHttpResponseConvertHandler;
+import org.opensearch.migrations.replay.datahandlers.http.NettyJsonBodyAccumulateHandler;
+import org.opensearch.migrations.replay.datatypes.ByteBufList;
 import org.opensearch.migrations.replay.tracing.IReplayContexts;
-import org.opensearch.migrations.replay.util.NettyUtils;
 import org.opensearch.migrations.replay.util.RefSafeHolder;
+import org.opensearch.migrations.replay.util.RefSafeStreamUtils;
+import org.opensearch.migrations.transform.JsonKeysForHttpMessage;
 
 import io.netty.buffer.ByteBuf;
-import io.netty.handler.codec.base64.Base64;
+import io.netty.buffer.Unpooled;
 import io.netty.handler.codec.base64.Base64Dialect;
-import io.netty.handler.codec.http.HttpHeaders;
 import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
 
@@ -34,11 +41,16 @@ import lombok.extern.slf4j.Slf4j;
 public class ParsedHttpMessagesAsDicts {
     public static final String STATUS_CODE_KEY = "Status-Code";
     public static final String RESPONSE_TIME_MS_KEY = "response_time_ms";
+    public static final String EXCEPTION_KEY_STRING = "Exception";
+    public static final String REQUEST_URI_KEY = "Request-URI";
+    public static final String METHOD_KEY = "Method";
+    public static final String HTTP_VERSION_KEY = "HTTP-Version";
+    public static final String PAYLOAD_KEY = "payload";
 
     public final Optional<Map<String, Object>> sourceRequestOp;
     public final Optional<Map<String, Object>> sourceResponseOp;
     public final Optional<Map<String, Object>> targetRequestOp;
-    public final Optional<Map<String, Object>> targetResponseOp;
+    public final List<Map<String, Object>> targetResponseList;
     public final IReplayContexts.ITupleHandlingContext context;
 
     public ParsedHttpMessagesAsDicts(@NonNull SourceTargetCaptureTuple tuple) {
@@ -58,15 +70,15 @@ public class ParsedHttpMessagesAsDicts {
         );
     }
 
-    private static Optional<Map<String, Object>> getTargetResponseOp(SourceTargetCaptureTuple tuple) {
-        return Optional.ofNullable(tuple.targetResponseData)
-            .filter(r -> !r.isEmpty())
-            .map(d -> convertResponse(tuple.context, d, tuple.targetResponseDuration));
+    private static List<Map<String, Object>> getTargetResponseOp(SourceTargetCaptureTuple tuple) {
+        return tuple.responseList.stream()
+            .map(r -> convertResponse(tuple.context, r.targetResponseData, r.targetResponseDuration))
+            .collect(Collectors.toList());
     }
 
     private static Optional<Map<String, Object>> getTargetRequestOp(SourceTargetCaptureTuple tuple) {
         return Optional.ofNullable(tuple.targetRequestData)
-            .map(TransformedPackets::asByteArrayStream)
+            .map(ByteBufList::asByteArrayStream)
             .map(d -> convertRequest(tuple.context, d.collect(Collectors.toList())));
     }
 
@@ -107,36 +119,32 @@ public class ParsedHttpMessagesAsDicts {
         Optional<Map<String, Object>> sourceRequestOp1,
         Optional<Map<String, Object>> sourceResponseOp2,
         Optional<Map<String, Object>> targetRequestOp3,
-        Optional<Map<String, Object>> targetResponseOp4
+        List<Map<String, Object>> targetResponseOps4
     ) {
         this.context = context;
         this.sourceRequestOp = sourceRequestOp1;
         this.sourceResponseOp = sourceResponseOp2;
         this.targetRequestOp = targetRequestOp3;
-        this.targetResponseOp = targetResponseOp4;
-        fillStatusCodeMetrics(context, sourceResponseOp, targetResponseOp);
+        this.targetResponseList = targetResponseOps4;
+        fillStatusCodeMetrics(context, sourceResponseOp, targetResponseOps4);
     }
 
     public static void fillStatusCodeMetrics(
         @NonNull IReplayContexts.ITupleHandlingContext context,
         Optional<Map<String, Object>> sourceResponseOp,
-        Optional<Map<String, Object>> targetResponseOp
+        List<Map<String, Object>> targetResponseList
     ) {
         sourceResponseOp.ifPresent(r -> context.setSourceStatus((Integer) r.get(STATUS_CODE_KEY)));
-        targetResponseOp.ifPresent(r -> context.setTargetStatus((Integer) r.get(STATUS_CODE_KEY)));
+        if (!targetResponseList.isEmpty()) {
+            context.setTargetStatus((Integer) targetResponseList.get(targetResponseList.size() - 1).get(STATUS_CODE_KEY));
+        }
     }
-
-    private static Map<String, Object> fillMap(
-        LinkedHashMap<String, Object> map,
-        HttpHeaders headers,
-        ByteBuf content
-    ) {
-        try (var encodedBufHolder = RefSafeHolder.create(Base64.encode(content, false, Base64Dialect.STANDARD))) {
+    private static String byteBufToBase64String(ByteBuf content) {
+        try (var encodedBufHolder = RefSafeHolder.create(io.netty.handler.codec.base64.Base64.encode(content.duplicate(),
+            false, Base64Dialect.STANDARD))) {
             var encodedBuf = encodedBufHolder.get();
             assert encodedBuf != null : "Base64.encode should not return null";
-            headers.entries().forEach(kvp -> map.put(kvp.getKey(), kvp.getValue()));
-            map.put("body", encodedBuf.toString(StandardCharsets.UTF_8));
-            return map;
+            return encodedBuf.toString(StandardCharsets.UTF_8);
         }
     }
 
@@ -149,15 +157,12 @@ public class ParsedHttpMessagesAsDicts {
         } catch (Exception e) {
             // TODO - this isn't a good design choice.
             // We should follow through with the spirit of this class and leave this as empty optional values
-            log.atWarn()
-                .setMessage(
-                    () -> "Putting what may be a bogus value in the output because transforming it "
-                        + "into json threw an exception for "
-                        + context
-                )
-                .setCause(e)
+            log.atWarn().setCause(e)
+                .setMessage("Putting what may be a bogus value in the output because transforming it "
+                        + "into json threw an exception for {}")
+                .addArgument(context)
                 .log();
-            return Map.of("Exception", (Object) e.toString());
+            return Map.of(EXCEPTION_KEY_STRING, (Object) e.toString());
         }
     }
 
@@ -166,22 +171,35 @@ public class ParsedHttpMessagesAsDicts {
         @NonNull List<byte[]> data
     ) {
         return makeSafeMap(context, () -> {
-            var map = new LinkedHashMap<String, Object>();
-            try (
-                var bufStream = NettyUtils.createRefCntNeutralCloseableByteBufStream(data);
-                var messageHolder = RefSafeHolder.create(HttpByteBufFormatter.parseHttpRequestFromBufs(bufStream))
-            ) {
-                var message = messageHolder.get();
+            try (var transformationCtx = context.getLogicalEnclosingScope().createTransformationContext();
+                var messageHolder = RefSafeHolder.create(
+                    RefSafeStreamUtils.refSafeTransform(
+                    data.stream(),
+                    Unpooled::wrappedBuffer,
+                    byteBufStream ->
+                        HttpByteBufFormatter.processHttpMessageFromBufs(
+                            HttpMessageType.REQUEST,
+                            byteBufStream,
+                            new NettyDecodedHttpRequestConvertHandler(transformationCtx),
+                            new NettyJsonBodyAccumulateHandler(transformationCtx)
+                        )
+                    ))) {
+                var message = (HttpJsonRequestWithFaultingPayload) messageHolder.get();
                 if (message != null) {
-                    map.put("Request-URI", message.uri());
-                    map.put("Method", message.method().toString());
-                    map.put("HTTP-Version", message.protocolVersion().toString());
-                    context.setMethod(message.method().toString());
-                    context.setEndpoint(message.uri());
-                    context.setHttpVersion(message.protocolVersion().toString());
-                    return fillMap(map, message.headers(), message.content());
+                    var map = new LinkedHashMap<>(message.headers());
+                    map.put(REQUEST_URI_KEY, message.path());
+                    map.put(METHOD_KEY, message.method());
+                    map.put(HTTP_VERSION_KEY, message.protocol());
+                    context.setMethod(message.method());
+                    context.setEndpoint(message.path());
+                    context.setHttpVersion(message.protocol());
+                    encodeBinaryPayloadIfExists(message);
+                    if (!message.payload().isEmpty()) {
+                        map.put(PAYLOAD_KEY, message.payload());
+                    }
+                    return map;
                 } else {
-                    return Map.of("Exception", "Message couldn't be parsed as a full http message");
+                    return Map.of(EXCEPTION_KEY_STRING, "Message couldn't be parsed as a full http message");
                 }
             }
         });
@@ -193,22 +211,49 @@ public class ParsedHttpMessagesAsDicts {
         Duration latency
     ) {
         return makeSafeMap(context, () -> {
-            var map = new LinkedHashMap<String, Object>();
-            try (
-                var bufStream = NettyUtils.createRefCntNeutralCloseableByteBufStream(data);
-                var messageHolder = RefSafeHolder.create(HttpByteBufFormatter.parseHttpResponseFromBufs(bufStream))
-            ) {
-                var message = messageHolder.get();
+            try (var transformationCtx = context.getLogicalEnclosingScope().createTransformationContext();
+                var messageHolder = RefSafeHolder.create(
+                    RefSafeStreamUtils.refSafeTransform(
+                        data.stream(),
+                        Unpooled::wrappedBuffer,
+                        byteBufStream ->
+                            HttpByteBufFormatter.processHttpMessageFromBufs(
+                                HttpMessageType.RESPONSE,
+                                byteBufStream,
+                                new NettyDecodedHttpResponseConvertHandler(transformationCtx),
+                                new NettyJsonBodyAccumulateHandler(transformationCtx)
+                            )
+                    ))) {
+                var message = (HttpJsonResponseWithFaultingPayload) messageHolder.get();
                 if (message != null) {
-                    map.put("HTTP-Version", message.protocolVersion());
-                    map.put(STATUS_CODE_KEY, message.status().code());
-                    map.put("Reason-Phrase", message.status().reasonPhrase());
+                    var map = new LinkedHashMap<>(message.headers());
+                    map.put(HTTP_VERSION_KEY, message.protocol());
+                    map.put(STATUS_CODE_KEY, Integer.parseInt(message.code()));
+                    map.put("Reason-Phrase", message.reason());
                     map.put(RESPONSE_TIME_MS_KEY, latency.toMillis());
-                    return fillMap(map, message.headers(), message.content());
+                    context.setHttpVersion(message.protocol());
+                    encodeBinaryPayloadIfExists(message);
+                    if (!message.payload().isEmpty()) {
+                        map.put(PAYLOAD_KEY, message.payload());
+                    }
+                    return map;
                 } else {
-                    return Map.of("Exception", "Message couldn't be parsed as a full http message");
+                    return Map.of(EXCEPTION_KEY_STRING, "Message couldn't be parsed as a full http message");
                 }
             }
         });
+    }
+
+    private static void encodeBinaryPayloadIfExists(HttpJsonMessageWithFaultingPayload message) {
+        if (message.payload() != null) {
+            if (message.payload().containsKey(JsonKeysForHttpMessage.INLINED_BINARY_BODY_DOCUMENT_KEY)) {
+                var byteBufBinaryBody = (ByteBuf) message.payload().get(JsonKeysForHttpMessage.INLINED_BINARY_BODY_DOCUMENT_KEY);
+                assert !message.payload().containsKey(JsonKeysForHttpMessage.INLINED_BASE64_BODY_DOCUMENT_KEY) :
+                    "Expected " + JsonKeysForHttpMessage.INLINED_BASE64_BODY_DOCUMENT_KEY + " to not exist.";
+                message.payload().put(JsonKeysForHttpMessage.INLINED_BASE64_BODY_DOCUMENT_KEY, byteBufToBase64String(byteBufBinaryBody));
+                message.payload().remove(JsonKeysForHttpMessage.INLINED_BINARY_BODY_DOCUMENT_KEY);
+                byteBufBinaryBody.release();
+            }
+        }
     }
 }

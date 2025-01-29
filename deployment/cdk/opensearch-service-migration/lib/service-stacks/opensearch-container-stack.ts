@@ -42,7 +42,7 @@ export class OpenSearchContainerStack extends MigrationServiceCore {
 
         const deployId = props.addOnMigrationDeployId ? props.addOnMigrationDeployId : props.defaultDeployId
 
-        let securityGroups = [
+        const securityGroups = [
             SecurityGroup.fromSecurityGroupId(this, "serviceSG", getMigrationStringParameterValue(this, {
                 ...props,
                 parameter: MigrationSSMParameter.SERVICE_SECURITY_GROUP_ID,
@@ -83,7 +83,7 @@ export class OpenSearchContainerStack extends MigrationServiceCore {
 
         this.createService({
             serviceName: dnsNameForContainer,
-            dockerImageRegistryName: "opensearchproject/opensearch:2",
+            dockerImageName: "opensearchproject/opensearch:2",
             securityGroups: securityGroups,
             environment: {
                 "cluster.name": "os-docker-cluster",

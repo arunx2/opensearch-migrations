@@ -5,10 +5,10 @@ import {ContainerImage} from "aws-cdk-lib/aws-ecs";
 import {describe, beforeEach, afterEach, test, expect, jest} from '@jest/globals';
 import {ReindexFromSnapshotStack} from "../lib";
 
-jest.mock('aws-cdk-lib/aws-ecr-assets');
+
 describe('Migration Console Stack Tests', () => {
-    // Mock the implementation of fromDockerImageAsset before all tests
     beforeEach(() => {
+        // Mock the implementation of fromDockerImageAsset before all tests
         jest.spyOn(ContainerImage, 'fromDockerImageAsset').mockImplementation(() => ContainerImage.fromRegistry("ServiceImage"));
     });
 
@@ -17,7 +17,6 @@ describe('Migration Console Stack Tests', () => {
         jest.clearAllMocks();
         jest.resetModules();
         jest.restoreAllMocks();
-        jest.resetAllMocks();
     });
 
     test('Migration Console task definition is updated when services.yaml inputs change', () => {
@@ -25,6 +24,9 @@ describe('Migration Console Stack Tests', () => {
             vpcEnabled: true,
             migrationAssistanceEnabled: true,
             migrationConsoleServiceEnabled: true,
+            migrationAPIEnabled: true,
+            migrationAPIAllowedHosts: "test-endpoint1",
+            migrationConsoleEnableOSI: true,
             sourceClusterEndpoint: "https://test-cluster",
             reindexFromSnapshotServiceEnabled: true,
             trafficReplayerServiceEnabled: true,
@@ -73,7 +75,9 @@ describe('Migration Console Stack Tests', () => {
         expect(initialEnv).not.toEqual(updatedEnv);
 
         // Specifically check if the MIGRATION_SERVICES_YAML_HASH has changed
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const initialYamlHash = initialEnv.find((env: any) => env.Name === "MIGRATION_SERVICES_YAML_HASH").Value;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const updatedYamlHash = updatedEnv.find((env: any) => env.Name === "MIGRATION_SERVICES_YAML_HASH").Value;
 
         expect(initialYamlHash).not.toEqual(updatedYamlHash);

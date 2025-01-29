@@ -4,24 +4,20 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
-
-import com.google.protobuf.ByteString;
-import com.google.protobuf.Timestamp;
-import org.junit.jupiter.api.Assertions;
-import org.junit.jupiter.api.Tag;
-import org.junit.jupiter.api.Test;
 
 import org.opensearch.migrations.replay.datatypes.ITrafficStreamKey;
 import org.opensearch.migrations.replay.tracing.IReplayContexts;
@@ -35,9 +31,15 @@ import org.opensearch.migrations.trafficcapture.protos.ReadObservation;
 import org.opensearch.migrations.trafficcapture.protos.TrafficObservation;
 import org.opensearch.migrations.trafficcapture.protos.TrafficStream;
 import org.opensearch.migrations.trafficcapture.protos.WriteObservation;
+import org.opensearch.migrations.transform.TransformationLoader;
 
+import com.google.protobuf.ByteString;
+import com.google.protobuf.Timestamp;
 import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Tag;
+import org.junit.jupiter.api.Test;
 import org.slf4j.event.Level;
 
 @Slf4j
@@ -140,7 +142,7 @@ class TrafficReplayerTest extends InstrumentationTest {
     }
 
     @Test
-    public void testDelimitedDeserializer() throws Exception {
+    public void testInputStreamOfTrafficDeserializer() throws Exception {
         final Instant timestamp = Instant.now();
         byte[] serializedChunks = synthesizeTrafficStreamsIntoByteArray(timestamp, 3);
         try (var bais = new ByteArrayInputStream(serializedChunks)) {
@@ -171,11 +173,16 @@ class TrafficReplayerTest extends InstrumentationTest {
         }
     }
 
+    public static void serialize(TrafficStream ts, OutputStream os) throws IOException {
+        os.write(Base64.getEncoder().encode(ts.toByteArray()));
+        os.write('\n');
+    }
+
     static byte[] synthesizeTrafficStreamsIntoByteArray(Instant timestamp, int numStreams) throws IOException {
         byte[] serializedChunks;
         try (var baos = new ByteArrayOutputStream()) {
             for (int i = 0; i < numStreams; ++i) {
-                makeTrafficStream(timestamp.plus(i, ChronoUnit.SECONDS), i + 1).writeDelimitedTo(baos);
+                serialize(makeTrafficStream(timestamp.plus(i, ChronoUnit.SECONDS), i + 1), baos);
             }
             serializedChunks = baos.toByteArray();
         }
@@ -183,6 +190,7 @@ class TrafficReplayerTest extends InstrumentationTest {
     }
 
     @Test
+    @WrapWithNettyLeakDetection(repetitions = 1)
     public void testReader() throws Exception {
         var uri = new URI("http://localhost:9200");
         try (
@@ -191,7 +199,7 @@ class TrafficReplayerTest extends InstrumentationTest {
                 uri,
                 null,
                 null,
-                RootReplayerConstructorExtensions.makeClientConnectionPool(uri)
+                RootReplayerConstructorExtensions.makeNettyPacketConsumerConnectionPool(uri)
             )
         ) {
             List<List<byte[]>> byteArrays = new ArrayList<>();
@@ -256,6 +264,7 @@ class TrafficReplayerTest extends InstrumentationTest {
 
     @Test
     @Tag("longTest")
+    @WrapWithNettyLeakDetection(repetitions = 2)
     public void testCapturedReadsAfterCloseAreHandledAsNew() throws Exception {
         var uri = new URI("http://localhost:9200");
         try (
@@ -263,8 +272,8 @@ class TrafficReplayerTest extends InstrumentationTest {
                 rootContext,
                 uri,
                 null,
-                new TransformationLoader().getTransformerFactoryLoader("localhost"),
-                RootReplayerConstructorExtensions.makeClientConnectionPool(uri)
+                new TransformationLoader().getTransformerFactoryLoaderWithNewHostName("localhost"),
+                RootReplayerConstructorExtensions.makeNettyPacketConsumerConnectionPool(uri)
             )
         ) {
             List<List<byte[]>> byteArrays = new ArrayList<>();
@@ -314,20 +323,20 @@ class TrafficReplayerTest extends InstrumentationTest {
                 );
             byte[] serializedChunks;
             try (var baos = new ByteArrayOutputStream()) {
-                makeTrafficStream(Instant.now(), 1).writeDelimitedTo(baos);
-                TrafficStream.newBuilder()
-                    .setNumberOfThisLastChunk(2)
-                    .setNodeId(TEST_NODE_ID_STRING)
-                    .setConnectionId(TEST_TRAFFIC_STREAM_ID_STRING)
-                    .addSubStream(
-                        TrafficObservation.newBuilder()
-                            .setTs(getProtobufTimestamp(Instant.now()))
-                            .setClose(CloseObservation.getDefaultInstance())
-                            .build()
-                    )
-                    .build()
-                    .writeDelimitedTo(baos);
-                makeTrafficStream(Instant.now(), 3).writeDelimitedTo(baos);
+                serialize(makeTrafficStream(Instant.now(), 1), baos);
+                serialize(TrafficStream.newBuilder()
+                        .setNumberOfThisLastChunk(2)
+                        .setNodeId(TEST_NODE_ID_STRING)
+                        .setConnectionId(TEST_TRAFFIC_STREAM_ID_STRING)
+                        .addSubStream(
+                            TrafficObservation.newBuilder()
+                                .setTs(getProtobufTimestamp(Instant.now()))
+                                .setClose(CloseObservation.getDefaultInstance())
+                                .build()
+                        )
+                        .build(),
+                    baos);
+                serialize(makeTrafficStream(Instant.now(), 3), baos);
                 serializedChunks = baos.toByteArray();
             }
 

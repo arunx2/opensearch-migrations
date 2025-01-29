@@ -12,19 +12,18 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
-import org.junit.jupiter.api.Assertions;
-import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.parallel.Isolated;
-
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.util.concurrent.DefaultPromise;
 import io.netty.util.concurrent.DefaultThreadFactory;
 import io.netty.util.concurrent.Future;
 import lombok.Lombok;
 import lombok.extern.slf4j.Slf4j;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Tag;
+import org.junit.jupiter.api.Test;
 
 @Slf4j
-@Isolated("Isolation based on temporal checks")
+@Tag("isolatedTest")
 class ExpiringSubstitutableItemPoolTest {
 
     public static final int NUM_POOLED_ITEMS = 5;
@@ -157,6 +156,8 @@ class ExpiringSubstitutableItemPoolTest {
         Assertions.assertTrue(
             pool.getStats().averageWaitTime().toMillis() < pool.getStats().averageBuildTime().toMillis()
         );
+
+        eventLoop.shutdownGracefully().sync();
     }
 
     private static Integer getNextItem(ExpiringSubstitutableItemPool<Future<Integer>, Integer> pool)

@@ -1,5 +1,7 @@
 package org.opensearch.migrations.replay.e2etests;
 
+import javax.net.ssl.SSLException;
+
 import java.io.EOFException;
 import java.io.IOException;
 import java.net.URI;
@@ -13,14 +15,6 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
-import javax.net.ssl.SSLException;
-
-import org.junit.jupiter.api.Assertions;
-import org.junit.jupiter.api.Tag;
-import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.parallel.ResourceLock;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.CsvSource;
 
 import org.opensearch.migrations.replay.CapturedTrafficToHttpTransactionAccumulator;
 import org.opensearch.migrations.replay.ReplayEngine;
@@ -28,7 +22,6 @@ import org.opensearch.migrations.replay.SourceTargetCaptureTuple;
 import org.opensearch.migrations.replay.TestHttpServerContext;
 import org.opensearch.migrations.replay.TimeShifter;
 import org.opensearch.migrations.replay.TrafficReplayerTopLevel;
-import org.opensearch.migrations.replay.TransformationLoader;
 import org.opensearch.migrations.replay.datatypes.ITrafficStreamKey;
 import org.opensearch.migrations.replay.datatypes.PojoTrafficStreamAndKey;
 import org.opensearch.migrations.replay.datatypes.PojoTrafficStreamKeyAndContext;
@@ -52,10 +45,17 @@ import org.opensearch.migrations.trafficcapture.protos.TrafficStreamUtils;
 import org.opensearch.migrations.transform.IAuthTransformerFactory;
 import org.opensearch.migrations.transform.IJsonTransformer;
 import org.opensearch.migrations.transform.StaticAuthTransformerFactory;
+import org.opensearch.migrations.transform.TransformationLoader;
 
 import lombok.Lombok;
 import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Tag;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceLock;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 @Slf4j
 // It would be great to test with leak detection here, but right now this test relies upon TrafficReplayer.shutdown()
@@ -90,8 +90,8 @@ public class FullTrafficReplayerTest extends InstrumentationTest {
                 context,
                 serverUri,
                 authTransformerFactory,
-                jsonTransformer,
-                TrafficReplayerTopLevel.makeClientConnectionPool(
+                () -> jsonTransformer,
+                TrafficReplayerTopLevel.makeNettyPacketConsumerConnectionPool(
                     serverUri,
                     allowInsecureConnections,
                     numSendingThreads,
@@ -175,7 +175,7 @@ public class FullTrafficReplayerTest extends InstrumentationTest {
                         true,
                         1,
                         1,
-                        new TransformationLoader().getTransformerFactoryLoader("localhost"),
+                        new TransformationLoader().getTransformerFactoryLoaderWithNewHostName("localhost"),
                         threadPrefix
                     );
                 } catch (SSLException e) {
@@ -220,7 +220,7 @@ public class FullTrafficReplayerTest extends InstrumentationTest {
                         true,
                         1,
                         1,
-                        new TransformationLoader().getTransformerFactoryLoader("localhost"),
+                        new TransformationLoader().getTransformerFactoryLoaderWithNewHostName("localhost"),
                         threadPrefix
                     );
                 } catch (SSLException e) {
@@ -252,10 +252,9 @@ public class FullTrafficReplayerTest extends InstrumentationTest {
             );
             var numExpectedRequests = streamAndSizes.numHttpTransactions;
             var trafficStreams = streamAndSizes.stream.collect(Collectors.toList());
-            log.atInfo()
-                .setMessage(
-                    () -> trafficStreams.stream()
-                        .map(ts -> TrafficStreamUtils.summarizeTrafficStream(ts))
+            log.atInfo().setMessage("{}")
+                .addArgument(() -> trafficStreams.stream()
+                        .map(TrafficStreamUtils::summarizeTrafficStream)
                         .collect(Collectors.joining("\n"))
                 )
                 .log();
@@ -304,7 +303,7 @@ public class FullTrafficReplayerTest extends InstrumentationTest {
                         true,
                         1,
                         1,
-                        new TransformationLoader().getTransformerFactoryLoader("localhost"),
+                        new TransformationLoader().getTransformerFactoryLoaderWithNewHostName("localhost"),
                         threadPrefix
                     );
                 } catch (SSLException e) {
@@ -316,8 +315,8 @@ public class FullTrafficReplayerTest extends InstrumentationTest {
     }
 
     @Test
+    @Tag("longTest")
     public void makeSureThatCollateralDamageDoesntFreezeTests() throws Throwable {
-
         var imposterThread = new Thread(() -> {
             while (true) {
                 try {
@@ -376,10 +375,9 @@ public class FullTrafficReplayerTest extends InstrumentationTest {
             );
             var numExpectedRequests = streamAndSizes.numHttpTransactions;
             var trafficStreams = streamAndSizes.stream.collect(Collectors.toList());
-            log.atInfo()
-                .setMessage(
-                    () -> trafficStreams.stream()
-                        .map(ts -> TrafficStreamUtils.summarizeTrafficStream(ts))
+            log.atInfo().setMessage("{}")
+                .addArgument(() -> trafficStreams.stream()
+                        .map(TrafficStreamUtils::summarizeTrafficStream)
                         .collect(Collectors.joining("\n"))
                 )
                 .log();

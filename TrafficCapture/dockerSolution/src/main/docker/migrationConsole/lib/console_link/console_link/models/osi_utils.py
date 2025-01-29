@@ -200,6 +200,20 @@ def construct_pipeline_config(pipeline_config_file_path: str, source_endpoint: s
     return pipeline_config
 
 
+# TODO: Reconcile status with internal status (https://opensearch.atlassian.net/browse/MIGRATIONS-1958)
+def get_status(osi_client, pipeline_name: str):
+    name = pipeline_name if pipeline_name is not None else DEFAULT_PIPELINE_NAME
+    logger.info(f"Getting status of pipeline: {name}")
+    get_pipeline_response = osi_client.get_pipeline(
+        PipelineName=name
+    )
+
+    return {
+        'status': get_pipeline_response['Pipeline']['Status'],
+        'statusMessage': get_pipeline_response['Pipeline']['StatusReason']['Description']
+    }
+
+
 def start_pipeline(osi_client, pipeline_name: str):
     name = pipeline_name if pipeline_name is not None else DEFAULT_PIPELINE_NAME
     logger.info(f"Starting pipeline: {name}")
@@ -270,11 +284,13 @@ def create_pipeline_from_env(osi_client,
     source_endpoint_clean = sanitize_endpoint(endpoint=source_cluster.endpoint, remove_port=False)
     # Target endpoints for OSI are not currently allowed a port
     target_endpoint_clean = sanitize_endpoint(target_cluster.endpoint, True)
-
+    source_auth_secret = None
+    if source_cluster.auth_details and "password_from_secret_arn" in source_cluster.auth_details:
+        source_auth_secret = source_cluster.auth_details["password_from_secret_arn"]
     pipeline_config_string = construct_pipeline_config(pipeline_config_file_path=pipeline_template_path,
                                                        source_endpoint=source_endpoint_clean,
                                                        source_auth_type=source_cluster.auth_type,
-                                                       source_auth_secret=source_cluster.aws_secret_arn,
+                                                       source_auth_secret=source_auth_secret,
                                                        target_endpoint=target_endpoint_clean,
                                                        target_auth_type=target_cluster.auth_type,
                                                        pipeline_role_arn=osi_props.pipeline_role_arn,

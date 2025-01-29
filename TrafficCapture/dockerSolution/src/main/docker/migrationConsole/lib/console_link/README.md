@@ -1,22 +1,24 @@
 # Console_link Library
 
-- [Services.yaml spec](#servicesyaml-spec)
+- [Console\_link Library](#console_link-library)
+  - [Services.yaml spec](#servicesyaml-spec)
     - [Cluster](#cluster)
     - [Metrics Source](#metrics-source)
     - [Backfill](#backfill)
-        - [Reindex From Snapshot](#reindex-from-snapshot)
-        - [OpenSearch Ingestion](#opensearch-ingestion)
+      - [Reindex From Snapshot](#reindex-from-snapshot)
+      - [OpenSearch Ingestion](#opensearch-ingestion)
     - [Snapshot](#snapshot)
     - [Metadata Migration](#metadata-migration)
     - [Replay](#replay)
     - [Kafka](#kafka)
-- [Usage](#usage)
+    - [Client Options](#client-options)
+  - [Usage](#usage)
     - [Library](#library)
     - [CLI](#cli)
-        - [Global Options](#global-options)
-        - [Objects](#objects)
-        - [Commands \& options](#commands--options)
-- [Development](#development)
+      - [Global Options](#global-options)
+      - [Objects](#objects)
+      - [Commands \& options](#commands--options)
+  - [Development](#development)
     - [Unit Tests](#unit-tests)
     - [Coverage](#coverage)
 
@@ -82,6 +84,8 @@ metadata_migration:
 kafka:
   broker_endpoints: "kafka:9092"
   standard:
+client_options:
+  user_agent_extra: "test-user-agent-v1.0"
 ```
 
 ## Services.yaml spec
@@ -92,6 +96,7 @@ Source and target clusters have the following options:
 
 - `endpoint`: required, the endpoint to reach the cluster.
 - `allow_insecure`: optional, default is false, equivalent to the curl `--insecure` flag, will not verify unsigned or invalid certificates
+- `version`: optional, default is to assume a version compatible with ES 7 or OS 1. Format should be `ES_7.10.2` or `OS_2.15`, for instance.
 
 Exactly one of the following blocks must be present:
 
@@ -131,7 +136,7 @@ Most of the parameters for these two are the same, with some additional ones spe
 - `reindex_from_snapshot`
     - `snapshot_repo`: optional, path to the snapshot repo. If not provided, ???
     - `snapshot_name`: optional, name of the snapshot to use as the source. If not provided, ???
-    - `scale`: optional int, number of instances to enable when `backfill start` is run. While running, this is modifiable with `backfill scale X`. Default is 1.
+    - `scale`: optional int, number of instances to enable when `backfill start` is run. While running, this is modifiable with `backfill scale X`. Default is 5.
 
 There is also a block that specifies the deployment type. Exactly one of the following blocks must be present:
 
@@ -186,6 +191,7 @@ Exactly one of the following blocks must be present:
 - `s3`:
     - `repo_uri`: required, `s3://` path to where the snapshot repo exists or should be created (the bucket must already exist, and the repo needs to be configured on the source cluster)
     - `aws_region`: required, region for the s3 bucket
+    - `role`: optional, required for clusters managed by Amazon OpenSearch Service.  The IAM Role that is passed to the source cluster for the service to assume in order to work with the snapshot bucket.  
 
 - `fs`:
     - `repo_path`: required, path to where the repo exists or should be created on the filesystem (the repo needs to be configured on the source cluster).
@@ -198,6 +204,7 @@ The metadata migration moves indices, components, and templates from a snapshot 
 - `index_allowlist`: optional, a list of index names. If this key is provided, only the named indices will be migrated. If the field is not provided, all non-system indices will be migrated.
 - `index_template_allowlist`: optional, a list of index template names. If this key is provided, only the named templates will be migrated. If the field is not provided, all templates will be migrated.
 - `component_template_allowlist`: optional, a list of component template names. If this key is provided, only the named component templates will be migrated. If the field is not provided, all component templates will be migrated.
+- `source_cluster_version`: optional, defaults to `ES_7.10.2`, which should work for closely related versions. Version of the source cluster from which the snapshot was taken and used for handling incompatible settings between versions.
 - `from_snapshot`: required. As mentioned above, `from_snapshot` is the only allowable source for a metadata migration at this point. This key must be present, but if it's value is null/empty, the snapshot details will be pulled from the top-level `snapshot` object. If a `snapshot` object does not exist, this block must be populated.
     - `snapshot_name`: required, as described in the Snapshot section
     - `s3` or `fs` block: exactly one must be present, as described in the Snapshot section
@@ -223,12 +230,18 @@ Exactly one of the following blocks must be present:
 
 A Kafka cluster is used in the capture and replay stage of the migration to store recorded requests and responses before they're replayed. While it's not necessary for a user to directly interact with the Kafka cluster in most cases, there are a handful of commands that can be helpful for checking on the status or resetting state that are exposed by the Console CLI.
 
-- `broker_endpoints`: required, comma-separated list of kafaka broker endpoints
+- `broker_endpoints`: required, comma-separated list of kafka broker endpoints
 
 Exactly one of the following keys must be present, but both are nullable (they don't have or need any additional parameters).
 
 - `msk`: the Kafka instance is deployed as AWS Managed Service Kafka
 - `standard`: the Kafka instance is deployed as a standard Kafka cluster (e.g. on Docker)
+
+### Client Options
+
+Client options are global settings that are applied to different clients used throughout this library
+
+- `user_agent_extra`: optional, a user agent string that will be appended to the `User-Agent` header of all requests from this library
 
 ## Usage
 
@@ -279,7 +292,7 @@ Unit tests can be run from this current `console_link/` by first installing depe
 
 ```shell
 pipenv install --dev
-pipenv run coverage run -m pytest
+pipenv run test
 ```
 
 ### Coverage

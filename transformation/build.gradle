@@ -23,15 +23,8 @@ plugins {
     id 'java-test-fixtures'
 }
 
-java.sourceCompatibility = JavaVersion.VERSION_11
-java.targetCompatibility = JavaVersion.VERSION_11
-
-repositories {
-    mavenCentral()
-}
-
 dependencies {
-    api project(":commonDependencyVersionConstraints")
+    implementation project(':transformation:transformationPlugins:jsonMessageTransformers:jsonMessageTransformerInterface')
 
     implementation group: 'org.slf4j', name: 'slf4j-api'
 
@@ -49,8 +42,4 @@ dependencies {
 
     testImplementation group: 'org.mockito', name: 'mockito-core'
     testImplementation group: 'org.hamcrest', name: 'hamcrest'
-}
-
-tasks.named('test') {
-    useJUnitPlatform()
 }

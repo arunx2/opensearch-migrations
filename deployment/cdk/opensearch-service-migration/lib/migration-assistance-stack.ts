@@ -1,6 +1,6 @@
 import {RemovalPolicy, Stack} from "aws-cdk-lib";
 import {IVpc, Port, SecurityGroup, SubnetFilter, SubnetType} from "aws-cdk-lib/aws-ec2";
-import {FileSystem} from 'aws-cdk-lib/aws-efs';
+import {FileSystem, LifecyclePolicy, ThroughputMode} from 'aws-cdk-lib/aws-efs';
 import {Construct} from "constructs";
 import {CfnConfiguration} from "aws-cdk-lib/aws-msk";
 import {Cluster} from "aws-cdk-lib/aws-ecs";
@@ -8,7 +8,11 @@ import {StackPropsExt} from "./stack-composer";
 import {LogGroup, RetentionDays} from "aws-cdk-lib/aws-logs";
 import {StreamingSourceType} from "./streaming-source-type";
 import {Bucket, BucketEncryption} from "aws-cdk-lib/aws-s3";
-import {createMigrationStringParameter, MigrationSSMParameter, parseRemovalPolicy} from "./common-utilities";
+import {
+    createMigrationStringParameter,
+    MigrationSSMParameter,
+    parseRemovalPolicy
+} from "./common-utilities";
 import {
     ClientAuthentication,
     ClientBrokerEncryption,
@@ -161,7 +165,8 @@ export class MigrationAssistanceStack extends Stack {
 
         const streamingSecurityGroup = new SecurityGroup(this, 'trafficStreamSourceSG', {
             vpc: props.vpc,
-            allowAllOutbound: false
+            allowAllOutbound: false,
+            allowAllIpv6Outbound: false,
         });
         streamingSecurityGroup.addIngressRule(streamingSecurityGroup, Port.allTraffic())
         createMigrationStringParameter(this, streamingSecurityGroup.securityGroupId, {
@@ -173,32 +178,36 @@ export class MigrationAssistanceStack extends Stack {
             this.createMSKResources(props, streamingSecurityGroup)
         }
 
-        const replayerOutputSG = new SecurityGroup(this, 'replayerOutputSG', {
+        const sharedLogsSG = new SecurityGroup(this, 'sharedLogsSG', {
             vpc: props.vpc,
             allowAllOutbound: false,
+            allowAllIpv6Outbound: false,
         });
-        replayerOutputSG.addIngressRule(replayerOutputSG, Port.allTraffic());
+        sharedLogsSG.addIngressRule(sharedLogsSG, Port.allTraffic());
 
-        createMigrationStringParameter(this, replayerOutputSG.securityGroupId, {
+        createMigrationStringParameter(this, sharedLogsSG.securityGroupId, {
             ...props,
-            parameter: MigrationSSMParameter.REPLAYER_OUTPUT_ACCESS_SECURITY_GROUP_ID
+            parameter: MigrationSSMParameter.SHARED_LOGS_SECURITY_GROUP_ID
         });
 
         // Create an EFS file system for Traffic Replayer output
-        const replayerOutputEFS = new FileSystem(this, 'replayerOutputEFS', {
+        const sharedLogsEFS = new FileSystem(this, 'sharedLogsEFS', {
             vpc: props.vpc,
-            securityGroup: replayerOutputSG,
-            removalPolicy: replayerEFSRemovalPolicy
+            securityGroup: sharedLogsSG,
+            removalPolicy: replayerEFSRemovalPolicy,
+            lifecyclePolicy: LifecyclePolicy.AFTER_1_DAY, // Cost break even is at 26 downloads / month
+            throughputMode: ThroughputMode.BURSTING, // Best cost characteristics for write heavy, short-lived data
         });
-        createMigrationStringParameter(this, replayerOutputEFS.fileSystemId, {
+        createMigrationStringParameter(this, sharedLogsEFS.fileSystemId, {
             ...props,
-            parameter: MigrationSSMParameter.REPLAYER_OUTPUT_EFS_ID
+            parameter: MigrationSSMParameter.SHARED_LOGS_EFS_ID
         });
 
         const serviceSecurityGroup = new SecurityGroup(this, 'serviceSecurityGroup', {
             vpc: props.vpc,
             // Required for retrieving ECR image at service startup
             allowAllOutbound: true,
+            allowAllIpv6Outbound: true,
         })
         serviceSecurityGroup.addIngressRule(serviceSecurityGroup, Port.allTraffic());
 

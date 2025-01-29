@@ -2,18 +2,15 @@ package org.opensearch.migrations.tracing;
 
 import java.time.Duration;
 
-import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.api.common.AttributesBuilder;
 import io.opentelemetry.api.metrics.DoubleHistogram;
 import io.opentelemetry.api.metrics.LongCounter;
 import io.opentelemetry.api.metrics.LongHistogram;
 import io.opentelemetry.api.metrics.LongUpDownCounter;
-
 import lombok.NonNull;
 
 public interface IInstrumentationAttributes {
-    AttributeKey<Boolean> HAD_EXCEPTION_KEY = AttributeKey.booleanKey("hadException");
 
     IInstrumentationAttributes getEnclosingScope();
 

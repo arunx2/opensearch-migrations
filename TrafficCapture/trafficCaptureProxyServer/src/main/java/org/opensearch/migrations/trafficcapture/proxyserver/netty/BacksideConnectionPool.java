@@ -1,9 +1,10 @@
 package org.opensearch.migrations.trafficcapture.proxyserver.netty;
 
+import javax.net.ssl.SSLEngine;
+
 import java.net.URI;
 import java.time.Duration;
 import java.util.concurrent.TimeUnit;
-import javax.net.ssl.SSLEngine;
 
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.ChannelDuplexHandler;
@@ -74,7 +75,7 @@ public class BacksideConnectionPool {
         Duration frequency
     ) {
         eventLoop.scheduleAtFixedRate(
-            () -> log.atLevel(logLevel).log(channelPoolMap.getStats().toString()),
+            () -> log.atLevel(logLevel).setMessage("{}").addArgument(channelPoolMap::getStats).log(),
             frequency.toMillis(),
             frequency.toMillis(),
             TimeUnit.MILLISECONDS

@@ -6,7 +6,6 @@ import { ClusterYaml } from '../lib/migration-services-yaml';
 import { ContainerImage } from "aws-cdk-lib/aws-ecs";
 import { describe, beforeEach, afterEach, test, expect, jest} from '@jest/globals';
 
-jest.mock('aws-cdk-lib/aws-ecr-assets');
 describe('OpenSearch Domain Stack Tests', () => {
   beforeEach(() => {
     jest.spyOn(ContainerImage, 'fromDockerImageAsset').mockImplementation(() => ContainerImage.fromRegistry("ServiceImage"));
@@ -16,7 +15,6 @@ describe('OpenSearch Domain Stack Tests', () => {
     jest.clearAllMocks();
     jest.resetModules();
     jest.restoreAllMocks();
-    jest.resetAllMocks();
   });
 
   test('Test primary context options are mapped with standard data type', () => {
@@ -57,7 +55,11 @@ describe('OpenSearch Domain Stack Tests', () => {
       vpcSecurityGroupIds: ["sg-123456789abcdefgh", "sg-223456789abcdefgh"],
       domainAZCount: 3,
       domainRemovalPolicy: "DESTROY",
-      sourceClusterEndpoint: "https://test-cluster",
+      sourceCluster: {
+        "endpoint": "https://test-cluster",
+        "auth": {"type": "none"},
+        "version": "ES_7.10"
+      }
     }
 
     const openSearchStacks = createStackComposer(contextOptions)
@@ -110,7 +112,11 @@ describe('OpenSearch Domain Stack Tests', () => {
       vpcSecurityGroupIds: "[\"sg-123456789abcdefgh\", \"sg-223456789abcdefgh\"]",
       domainAZCount: "3",
       domainRemovalPolicy: "DESTROY",
-      sourceClusterEndpoint: "https://test-cluster",
+      sourceCluster: {
+        "endpoint": "https://test-cluster",
+        "auth": {"type": "none"},
+        "version": "ES_7.10"
+      }
     }
 
     const openSearchStacks = createStackComposer(contextOptions)
@@ -143,7 +149,11 @@ describe('OpenSearch Domain Stack Tests', () => {
       enforceHTTPS: true,
       encryptionAtRestEnabled: true,
       nodeToNodeEncryptionEnabled: true,
-      sourceClusterEndpoint: "https://test-cluster",
+      sourceCluster: {
+        "endpoint": "https://test-cluster",
+        "auth": {"type": "none"},
+        "version": "ES_7.10"
+      }
     }
 
     const openSearchStacks = createStackComposer(contextOptions)
@@ -163,7 +173,11 @@ describe('OpenSearch Domain Stack Tests', () => {
       enforceHTTPS: "true",
       encryptionAtRestEnabled: "true",
       nodeToNodeEncryptionEnabled: "true",
-      sourceClusterEndpoint: "https://test-cluster",
+      sourceCluster: {
+        "endpoint": "https://test-cluster",
+        "auth": {"type": "none"},
+        "version": "ES_7.10"
+      }
     }
 
     const openSearchStacks = createStackComposer(contextOptions)

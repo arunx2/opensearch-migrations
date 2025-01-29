@@ -23,6 +23,7 @@ import org.opensearch.migrations.Utils;
 import org.opensearch.migrations.tracing.ActiveContextTracker;
 import org.opensearch.migrations.tracing.ActiveContextTrackerByActivityType;
 import org.opensearch.migrations.tracing.IScopedInstrumentationAttributes;
+import org.opensearch.migrations.utils.TrackedFuture;
 
 import lombok.AllArgsConstructor;
 import lombok.Getter;
@@ -382,7 +383,8 @@ public class ActiveContextMonitor implements Runnable {
                 }
                 if (numOutput++ == 0) {
                     logger.accept(
-                        getHigherLevel(levelForElementOp, Optional.of(Level.INFO)).get(),
+                        getHigherLevel(levelForElementOp, Optional.of(Level.INFO))
+                            .orElseThrow(IllegalStateException::new),
                         () -> "Oldest of " + totalItems + trailingGroupLabel
                     );
                 }

@@ -1,13 +1,21 @@
-from base64 import b64encode
-import os
-
-import pytest
-from moto import mock_aws
 import boto3
-
 import console_link.middleware.clusters as clusters_
-from console_link.models.cluster import AuthMethod, Cluster
+import hashlib
+import os
+import pytest
+import re
+import json
+import datetime
+from unittest.mock import patch
+
+from base64 import b64encode
+from botocore.auth import SigV4Auth
+from botocore.awsrequest import AWSRequest
+from console_link.models.client_options import ClientOptions
+from console_link.models.cluster import AuthMethod, Cluster, HttpMethod
+from moto import mock_aws
 from tests.utils import create_valid_cluster
+import requests
 
 
 @pytest.fixture(scope="function")
@@ -226,6 +234,51 @@ def test_valid_cluster_api_call_with_no_auth(requests_mock):
     assert response.json() == {'test': True}
 
 
+def test_valid_cluster_api_call_with_client_options(requests_mock):
+    test_user_agent = "test-agent-v1.0"
+    cluster = create_valid_cluster(auth_type=AuthMethod.NO_AUTH,
+                                   client_options=ClientOptions(config={"user_agent_extra": test_user_agent}))
+    assert isinstance(cluster, Cluster)
+
+    requests_mock.get(f"{cluster.endpoint}/test_api", json={'test': True})
+    response = cluster.call_api("/test_api")
+    assert response.headers == {}
+    assert response.status_code == 200
+    assert response.json() == {'test': True}
+
+    assert test_user_agent in requests_mock.last_request.headers['User-Agent']
+
+
+def test_valid_cluster_fetch_all_documents(requests_mock):
+    cluster = create_valid_cluster(auth_type=AuthMethod.NO_AUTH)
+    assert isinstance(cluster, Cluster)
+
+    test_index = "test_index"
+    batch_size = 1
+    test_scroll_id = "test_scroll_id"
+    requests_mock.post(
+        f"{cluster.endpoint}/{test_index}/_search?scroll=1m",
+        json={
+            "_scroll_id": test_scroll_id,
+            "hits": {
+                "hits": [{"_id": "id_1", "_source": {"test1": True}}]
+            }
+        }
+    )
+    requests_mock.post(
+        f"{cluster.endpoint}/_search/scroll",
+        json={
+            "_scroll_id": None,
+            "hits": {
+                "hits": [{"_id": "id_2", "_source": {"test2": True}}]
+            }
+        }
+    )
+    requests_mock.delete(f"{cluster.endpoint}/_search/scroll")
+    documents = [batch for batch in cluster.fetch_all_documents(test_index, batch_size=batch_size)]
+    assert documents == [{"id_1": {"test1": True}}, {"id_2": {"test2": True}}]
+
+
 def test_connection_check_with_exception(mocker):
     cluster = create_valid_cluster()
     api_mock = mocker.patch.object(Cluster, 'call_api', side_effect=Exception('Attempt to connect to cluster failed'))
@@ -305,3 +358,190 @@ def test_valid_cluster_api_call_with_sigv4_auth(requests_mock, aws_credentials):
         assert "Signature=" in auth_header
         assert "es" in auth_header
         assert "us-east-2" in auth_header
+
+
+def test_call_api_via_middleware(requests_mock):
+    cluster = create_valid_cluster(auth_type=AuthMethod.NO_AUTH)
+    requests_mock.get(f"{cluster.endpoint}/test_api", json={'test': True})
+
+    response = clusters_.call_api(cluster, '/test_api')
+    assert response.status_code == 200
+    assert response.json() == {'test': True}
+
+
+def test_cat_indices_with_refresh(requests_mock):
+    cluster = create_valid_cluster(auth_type=AuthMethod.NO_AUTH)
+    refresh_mock = requests_mock.get(f"{cluster.endpoint}/_refresh")
+    indices_mock = requests_mock.get(f"{cluster.endpoint}/_cat/indices/_all")
+
+    clusters_.cat_indices(cluster, refresh=True)
+    assert refresh_mock.call_count == 1
+    assert indices_mock.call_count == 1
+
+
+def test_clear_indices(requests_mock):
+    cluster = create_valid_cluster(auth_type=AuthMethod.NO_AUTH)
+    mock = requests_mock.delete(f"{cluster.endpoint}/*,-.*,-searchguard*,-sg7*,.migrations_working_state")
+    clusters_.clear_indices(cluster)
+    assert mock.call_count == 1
+
+
+def test_run_benchmark_executes_correctly_no_auth(mocker):
+    cluster = create_valid_cluster(auth_type=AuthMethod.NO_AUTH)
+    mock = mocker.patch("subprocess.run", autospec=True)
+    workload = "nyctaxis"
+    cluster.execute_benchmark_workload(workload=workload)
+    mock.assert_called_once_with("opensearch-benchmark execute-test --distribution-version=1.0.0"
+                                 " --exclude-tasks=check-cluster-health"
+                                 " --workload-revision=fc64258a9b2ed2451423d7758ca1c5880626c520"
+                                 f" --target-host={cluster.endpoint} --workload={workload}"
+                                 " --pipeline=benchmark-only"
+                                 " --test-mode --kill-running-processes --workload-params=target_throughput:0.5,"
+                                 "bulk_size:10,bulk_indexing_clients:1,search_clients:1 "
+                                 "--client-options=verify_certs:false", shell=True)
+
+
+def test_run_benchmark_raises_error_sigv4_auth():
+    cluster = create_valid_cluster(auth_type=AuthMethod.SIGV4, details={"region": "eu-west-1", "service": "aoss"})
+    workload = "nyctaxis"
+    with pytest.raises(NotImplementedError):
+        cluster.execute_benchmark_workload(workload=workload)
+
+
+def test_run_benchmark_executes_correctly_basic_auth_and_https(mocker):
+    auth_details = {"username": "admin", "password": "Admin1"}
+    cluster = create_valid_cluster(auth_type=AuthMethod.BASIC_AUTH, details=auth_details)
+    cluster.allow_insecure = False
+
+    mock = mocker.patch("subprocess.run", autospec=True)
+    workload = "nyctaxis"
+    cluster.execute_benchmark_workload(workload=workload)
+    mock.assert_called_once_with("opensearch-benchmark execute-test --distribution-version=1.0.0"
+                                 " --exclude-tasks=check-cluster-health"
+                                 " --workload-revision=fc64258a9b2ed2451423d7758ca1c5880626c520"
+                                 f" --target-host={cluster.endpoint} --workload={workload}"
+                                 " --pipeline=benchmark-only"
+                                 " --test-mode --kill-running-processes --workload-params=target_throughput:0.5,"
+                                 "bulk_size:10,bulk_indexing_clients:1,search_clients:1 "
+                                 "--client-options=verify_certs:false,use_ssl:true,"
+                                 f"basic_auth_user:{auth_details['username']},"
+                                 f"basic_auth_password:{auth_details['password']}", shell=True)
+
+
+@pytest.mark.parametrize("method, endpoint, data, has_body", [
+    (HttpMethod.GET, "/_cluster/health", None, False),
+    (HttpMethod.POST, "/_search", {"query": {"match_all": {}}}, True)
+])
+def test_sigv4_authentication_signature(requests_mock, method, endpoint, data, has_body):
+    # Set up a valid cluster configuration with SIGV4 authentication
+    sigv4_cluster_config = {
+        "endpoint": "https://opensearchtarget:9200",
+        "allow_insecure": True,
+        "sigv4": {
+            "region": "us-east-1",
+            "service": "es"
+        }
+    }
+    cluster = Cluster(sigv4_cluster_config)
+
+    # Prepare the mocked API response
+    url = f"{cluster.endpoint}{endpoint}"
+    if method == HttpMethod.GET:
+        requests_mock.get(url, json={'status': 'green'})
+    elif method == HttpMethod.POST:
+        requests_mock.post(url, json={'hits': {'total': 0, 'hits': []}})
+    # Mock datetime to return a specific timestamp
+    specific_time = datetime.datetime(2025, 1, 1, 12, 0, 0)
+    with mock_aws() and patch("datetime.datetime") as mock_datetime:
+        mock_datetime.utcnow.return_value = specific_time
+
+        # Add default headers to the request
+        headers = {
+            # These headers are excluded from signing since they are in default request headers
+            'User-Agent': 'my-test-agent',
+            'Accept': 'application/json',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive',
+            # Custom headers to be included in the request
+            'X-Custom-Header-1': 'CustomValue1',
+            'X-Custom-Header-2': 'CustomValue2'
+        }
+        if data is not None:
+            response = cluster.call_api(endpoint, method=method, data=json.dumps(data), headers=headers)
+        else:
+            response = cluster.call_api(endpoint, method=method, headers=headers)
+        assert response.status_code == 200
+
+        # Retrieve the last request made
+        last_request = requests_mock.last_request
+
+        # Verify the default headers are present in the request headers
+        for header_name, header_value in headers.items():
+            assert last_request.headers.get(header_name) == header_value
+
+        # Verify the Authorization header
+        auth_header = last_request.headers.get('Authorization')
+        assert auth_header is not None, "Authorization header is missing"
+        assert auth_header.startswith("AWS4-HMAC-SHA256"), "Incorrect Authorization header format"
+
+        # Extract SignedHeaders and Signature from the Authorization header
+        signed_headers_match = re.search(r"SignedHeaders=([^,]+)", auth_header)
+        signature_match = re.search(r"Signature=([a-f0-9]+)", auth_header)
+        assert signed_headers_match is not None, "SignedHeaders not found in Authorization header"
+        assert signature_match is not None, "Signature not found in Authorization header"
+
+        # Verify that default headers are not included in SignedHeaders
+        signed_headers = signed_headers_match.group(1).split(';')
+        default_headers = [header.lower() for header in headers.keys() if header.lower()
+                           in requests.utils.default_headers().keys()]
+        assert len(default_headers) > 0, "Default headers should contain at least one header"
+        for header in default_headers:
+            assert header not in signed_headers, f"Default header '{header}' should not be included in SignedHeaders"
+
+        # Verify that essential headers are included in SignedHeaders
+        required_headers = ['host', 'x-amz-date', 'x-custom-header-1', 'x-custom-header-2']
+        for header in required_headers:
+            assert header in signed_headers, f"Header '{header}' not found in SignedHeaders," + \
+                f" actual headers: {signed_headers}"
+
+        # Check that the x-amz-date header is present
+        amz_date_header = last_request.headers.get('x-amz-date')
+        assert amz_date_header is not None, "x-amz-date header is missing"
+
+        if has_body:
+            # Verify that the 'x-amz-content-sha256' header is present
+            content_sha256 = last_request.headers.get('x-amz-content-sha256')
+            assert content_sha256 is not None, 'x-amz-content-sha256 header is missing'
+            # Compute the SHA256 hash of the body
+            body_hash = hashlib.sha256(last_request.body.encode('utf-8')).hexdigest()
+            assert content_sha256 == body_hash, "x-amz-content-sha256 does not match body hash"
+
+        # Re-sign the request using botocore to verify the signature
+        session = boto3.Session()
+        credentials = session.get_credentials()
+        service_name = cluster.auth_details.get("service", "es")
+        region_name = cluster.auth_details.get("region", "us-east-1")
+        # Create a new AWSRequest
+        aws_request = AWSRequest(
+            method=last_request.method,
+            url=last_request.url,
+            data=last_request.body,
+            headers={k: v for k, v in last_request.headers.items() if
+                     k.lower() not in requests.utils.default_headers().keys()}
+        )
+        # Sign the request
+        SigV4Auth(credentials, service_name, region_name).add_auth(aws_request)
+
+        # Extract the new signature
+        new_auth_header = aws_request.headers.get('Authorization')
+        assert new_auth_header is not None, "Failed to generate new Authorization header"
+
+        # Compare timestamp
+        assert amz_date_header == aws_request.headers.get("x-amz-date")
+        # Compare signatures
+        original_signature = signature_match.group(1)
+        new_signature_match = re.search(r"Signature=([a-f0-9]+)", new_auth_header)
+        assert new_signature_match is not None, "New signature not found in Authorization header"
+        new_signature = new_signature_match.group(1)
+
+        assert original_signature == new_signature, "Signatures do not match"

@@ -1,13 +1,12 @@
 package org.opensearch.migrations.reindexer.tracing;
 
+import org.opensearch.migrations.bulkload.tracing.IRfsContexts;
+import org.opensearch.migrations.bulkload.tracing.IWorkCoordinationContexts;
 import org.opensearch.migrations.tracing.IScopedInstrumentationAttributes;
 
-import com.rfs.tracing.IRfsContexts;
-import com.rfs.tracing.IWorkCoordinationContexts;
+public interface IDocumentMigrationContexts {
 
-public abstract class IDocumentMigrationContexts {
-
-    public static class ActivityNames {
+    class ActivityNames {
         private ActivityNames() {}
 
         public static final String DOCUMENT_REINDEX = "documentReindex";
@@ -15,11 +14,11 @@ public abstract class IDocumentMigrationContexts {
         public static final String ADD_SHARD_WORK_ITEM = "addShardWorkItem";
     }
 
-    public static class MetricNames {
+    class MetricNames {
         private MetricNames() {}
     }
 
-    public interface IShardSetupAttemptContext extends IScopedInstrumentationAttributes {
+    interface IShardSetupAttemptContext extends IScopedInstrumentationAttributes {
         String ACTIVITY_NAME = ActivityNames.SHARD_SETUP_ATTEMPT;
 
         IWorkCoordinationContexts.IAcquireSpecificWorkContext createWorkAcquisitionContext();
@@ -27,15 +26,17 @@ public abstract class IDocumentMigrationContexts {
         IWorkCoordinationContexts.ICompleteWorkItemContext createWorkCompletionContext();
 
         IAddShardWorkItemContext createShardWorkItemContext();
+
+        IWorkCoordinationContexts.ICreateSuccessorWorkItemsContext createSuccessorWorkItemsContext();
     }
 
-    public interface IAddShardWorkItemContext extends IScopedInstrumentationAttributes {
+    interface IAddShardWorkItemContext extends IScopedInstrumentationAttributes {
         String ACTIVITY_NAME = ActivityNames.ADD_SHARD_WORK_ITEM;
 
         IWorkCoordinationContexts.ICreateUnassignedWorkItemContext createUnassignedWorkItemContext();
     }
 
-    public interface IDocumentReindexContext
+    interface IDocumentReindexContext
         extends
             IWorkCoordinationContexts.IScopedWorkContext<IWorkCoordinationContexts.IAcquireNextWorkItemContext> {
         String ACTIVITY_NAME = ActivityNames.DOCUMENT_REINDEX;
@@ -43,5 +44,8 @@ public abstract class IDocumentMigrationContexts {
         IRfsContexts.IRequestContext createBulkRequest();
 
         IRfsContexts.IRequestContext createRefreshContext();
+
+        IWorkCoordinationContexts.ICreateSuccessorWorkItemsContext createSuccessorWorkItemsContext();
+
     }
 }

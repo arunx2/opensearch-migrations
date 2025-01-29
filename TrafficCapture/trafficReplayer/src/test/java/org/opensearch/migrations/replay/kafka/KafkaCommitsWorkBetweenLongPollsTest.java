@@ -5,23 +5,22 @@ import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.LinkedBlockingQueue;
 
-import org.apache.kafka.clients.consumer.KafkaConsumer;
-import org.apache.kafka.clients.producer.Producer;
-import org.junit.jupiter.api.Assertions;
-import org.junit.jupiter.api.Tag;
-import org.junit.jupiter.api.Test;
-
 import org.opensearch.migrations.replay.traffic.source.BlockingTrafficSource;
 import org.opensearch.migrations.replay.traffic.source.ITrafficStreamWithKey;
+import org.opensearch.migrations.testutils.SharedDockerImageNames;
 import org.opensearch.migrations.tracing.InstrumentationTest;
 
 import lombok.Lombok;
 import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.producer.Producer;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Tag;
+import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.KafkaContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
-import org.testcontainers.utility.DockerImageName;
 
 @Slf4j
 @Testcontainers(disabledWithoutDocker = true)
@@ -33,9 +32,7 @@ public class KafkaCommitsWorkBetweenLongPollsTest extends InstrumentationTest {
     @Container
     // see
     // https://docs.confluent.io/platform/current/installation/versions-interoperability.html#cp-and-apache-kafka-compatibility
-    private final KafkaContainer embeddedKafkaBroker = new KafkaContainer(
-        DockerImageName.parse("confluentinc/cp-kafka:7.5.0")
-    );
+    private final KafkaContainer embeddedKafkaBroker = new KafkaContainer(SharedDockerImageNames.KAFKA);
 
     @SneakyThrows
     private KafkaConsumer<String, byte[]> buildKafkaConsumer() {
@@ -47,7 +44,7 @@ public class KafkaCommitsWorkBetweenLongPollsTest extends InstrumentationTest {
         );
         kafkaConsumerProps.setProperty("max.poll.interval.ms", DEFAULT_POLL_INTERVAL_MS + "");
         var kafkaConsumer = new KafkaConsumer<String, byte[]>(kafkaConsumerProps);
-        log.atInfo().setMessage(() -> "Just built KafkaConsumer=" + kafkaConsumer).log();
+        log.atInfo().setMessage("Just built KafkaConsumer={}").addArgument(kafkaConsumer).log();
         return kafkaConsumer;
     }
 

@@ -7,8 +7,8 @@ import org.opensearch.migrations.replay.datahandlers.IPacketFinalizingConsumer;
 import org.opensearch.migrations.replay.datatypes.HttpRequestTransformationStatus;
 import org.opensearch.migrations.replay.datatypes.TransformedOutputAndResult;
 import org.opensearch.migrations.replay.tracing.IReplayContexts;
-import org.opensearch.migrations.replay.util.TextTrackedFuture;
-import org.opensearch.migrations.replay.util.TrackedFuture;
+import org.opensearch.migrations.utils.TextTrackedFuture;
+import org.opensearch.migrations.utils.TrackedFuture;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
@@ -78,9 +78,11 @@ public class NettySendByteBufsToPacketHandlerHandler<R> extends ChannelInboundHa
         var packetReceiverCompletionFuture = currentFuture.getDeferredFutureThroughHandle((v1, t1) -> {
             assert v1 != null
                 : "expected in progress Boolean to be not null since null should signal that work was never started";
-            var transformationStatus = v1.booleanValue()
-                ? HttpRequestTransformationStatus.COMPLETED
-                : HttpRequestTransformationStatus.ERROR;
+            // TODO - spend some more time on this block of code.  I'm not sure what the error would be
+            var transformationStatus = v1
+                ? HttpRequestTransformationStatus.completed()
+                : HttpRequestTransformationStatus.makeError(
+                    new IllegalStateException("current future failed when inspected by the handlerRemoved callback"));
             return packetReceiver.finalizeRequest()
                 .getDeferredFutureThroughHandle(
                     (v2, t2) -> wrapFinalizedResultWithExceptionHandling(t1, v2, t2, transformationStatus),
@@ -120,7 +122,7 @@ public class NettySendByteBufsToPacketHandlerHandler<R> extends ChannelInboundHa
         } else {
             return TextTrackedFuture.completedFuture(
                 Optional.ofNullable(v2)
-                    .map(r -> new TransformedOutputAndResult<R>(r, transformationStatus, null))
+                    .map(r -> new TransformedOutputAndResult<R>(r, transformationStatus))
                     .orElse(null),
                 () -> "fixed value from packetReceiver.finalizeRequest()"
             );
@@ -154,33 +156,28 @@ public class NettySendByteBufsToPacketHandlerHandler<R> extends ChannelInboundHa
                     + System.identityHashCode(ctx)
             );
             var bb = (ByteBuf) msg;
-            log.atTrace().setMessage(() -> "Send bb.refCnt=" + bb.refCnt() + " " + System.identityHashCode(bb)).log();
+            log.atTrace().setMessage("Send bb.refCnt={} {}")
+                .addArgument(bb::refCnt)
+                .addArgument(() -> System.identityHashCode(bb))
+                .log();
             // I don't want to capture the *this* object, the preexisting value of the currentFuture field only
             final var preexistingFutureForCapture = currentFuture;
             var numBytesToSend = bb.readableBytes();
             currentFuture = currentFuture.getDeferredFutureThroughHandle((v, t) -> {
                 try {
                     if (t != null) {
-                        log.atInfo()
-                            .setCause(t)
-                            .setMessage(
-                                () -> "got exception from a previous future that "
-                                    + "will prohibit sending any more data to the packetReceiver"
-                            )
-                            .log();
+                        log.atInfo().setCause(t).setMessage("got exception from a previous future that "
+                                + "will prohibit sending any more data to the packetReceiver").log();
                         return TextTrackedFuture.failedFuture(t, () -> "failed previous future");
                     } else {
-                        log.atTrace()
-                            .setMessage(
-                                () -> "chaining consumingBytes with "
-                                    + msg
-                                    + " lastFuture="
-                                    + preexistingFutureForCapture
-                            )
+                        log.atTrace().setMessage("chaining consumingBytes with {} lastFuture={}")
+                            .addArgument(msg)
+                            .addArgument(preexistingFutureForCapture)
                             .log();
                         var rval = packetReceiver.consumeBytes(bb);
-                        log.atTrace()
-                            .setMessage(() -> "packetReceiver.consumeBytes()=" + rval + " bb.refCnt=" + bb.refCnt())
+                        log.atTrace().setMessage("packetReceiver.consumeBytes()={} bb.refCnt={}")
+                            .addArgument(rval)
+                            .addArgument(bb::refCnt)
                             .log();
                         return rval.map(
                             cf -> cf.thenApply(ignore -> false),

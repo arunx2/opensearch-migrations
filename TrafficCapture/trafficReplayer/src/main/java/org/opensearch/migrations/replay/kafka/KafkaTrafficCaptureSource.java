@@ -20,11 +20,6 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
-import com.google.protobuf.InvalidProtocolBufferException;
-import org.apache.kafka.clients.consumer.Consumer;
-import org.apache.kafka.clients.consumer.ConsumerConfig;
-import org.apache.kafka.clients.consumer.KafkaConsumer;
-
 import org.opensearch.migrations.replay.datatypes.ITrafficStreamKey;
 import org.opensearch.migrations.replay.datatypes.PojoTrafficStreamAndKey;
 import org.opensearch.migrations.replay.tracing.ChannelContextManager;
@@ -35,10 +30,14 @@ import org.opensearch.migrations.replay.traffic.source.ISimpleTrafficCaptureSour
 import org.opensearch.migrations.replay.traffic.source.ITrafficStreamWithKey;
 import org.opensearch.migrations.trafficcapture.protos.TrafficStream;
 
+import com.google.protobuf.InvalidProtocolBufferException;
 import io.netty.util.concurrent.DefaultThreadFactory;
 import lombok.NonNull;
 import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
 
 /**
  * Adapt a Kafka stream into a TrafficCaptureSource.
@@ -237,11 +236,10 @@ public class KafkaTrafficCaptureSource implements ISimpleTrafficCaptureSource {
                 try {
                     TrafficStream ts = TrafficStream.parseFrom(kafkaRecord.value());
                     var trafficStreamsSoFar = trafficStreamsRead.incrementAndGet();
-                    log.atTrace()
-                        .setMessage("{}")
-                        .addArgument(
-                            () -> "Parsed traffic stream #" + trafficStreamsSoFar + ": " + offsetData + " " + ts
-                        )
+                    log.atTrace().setMessage("Parsed traffic stream #{}: {} {}")
+                        .addArgument(trafficStreamsSoFar)
+                        .addArgument(offsetData)
+                        .addArgument(ts)
                         .log();
                     var key = new TrafficStreamKeyWithKafkaRecordId(tsk -> {
                         var channelKeyCtx = channelContextManager.retainOrCreateContext(tsk);

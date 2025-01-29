@@ -15,19 +15,12 @@ import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
-import com.google.protobuf.ByteString;
-import com.google.protobuf.Timestamp;
-import org.junit.jupiter.api.Assertions;
-import org.junit.jupiter.api.Tag;
-import org.junit.jupiter.api.Test;
-
 import org.opensearch.migrations.replay.RootReplayerConstructorExtensions;
 import org.opensearch.migrations.replay.TimeShifter;
-import org.opensearch.migrations.replay.TransformationLoader;
 import org.opensearch.migrations.replay.traffic.source.ArrayCursorTrafficCaptureSource;
 import org.opensearch.migrations.replay.traffic.source.ArrayCursorTrafficSourceContext;
 import org.opensearch.migrations.replay.traffic.source.BlockingTrafficSource;
-import org.opensearch.migrations.testutils.HttpRequestFirstLine;
+import org.opensearch.migrations.testutils.HttpRequest;
 import org.opensearch.migrations.testutils.SimpleHttpResponse;
 import org.opensearch.migrations.testutils.SimpleNettyHttpServer;
 import org.opensearch.migrations.tracing.InMemoryInstrumentationBundle;
@@ -37,8 +30,14 @@ import org.opensearch.migrations.trafficcapture.protos.ReadObservation;
 import org.opensearch.migrations.trafficcapture.protos.TrafficObservation;
 import org.opensearch.migrations.trafficcapture.protos.TrafficStream;
 import org.opensearch.migrations.transform.StaticAuthTransformerFactory;
+import org.opensearch.migrations.transform.TransformationLoader;
 
+import com.google.protobuf.ByteString;
+import com.google.protobuf.Timestamp;
 import lombok.SneakyThrows;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Tag;
+import org.junit.jupiter.api.Test;
 
 public class SlowAndExpiredTrafficStreamBecomesTwoTargetChannelsTest {
 
@@ -120,8 +119,8 @@ public class SlowAndExpiredTrafficStreamBecomesTwoTargetChannelsTest {
                 rc,
                 httpServer.localhostEndpoint(),
                 new StaticAuthTransformerFactory("TEST"),
-                new TransformationLoader().getTransformerFactoryLoader("localhost"),
-                RootReplayerConstructorExtensions.makeClientConnectionPool(
+                new TransformationLoader().getTransformerFactoryLoaderWithNewHostName("localhost"),
+                RootReplayerConstructorExtensions.makeNettyPacketConsumerConnectionPool(
                     httpServer.localhostEndpoint(),
                     true,
                     0,
@@ -172,7 +171,7 @@ public class SlowAndExpiredTrafficStreamBecomesTwoTargetChannelsTest {
         return "/" + connection + "/" + Integer.toString(i);
     }
 
-    private static class TrackingResponseBuilder implements Function<HttpRequestFirstLine, SimpleHttpResponse> {
+    private static class TrackingResponseBuilder implements Function<HttpRequest, SimpleHttpResponse> {
         List<String> pathsReceivedList;
         CountDownLatch targetRequestsPending;
 
@@ -182,8 +181,8 @@ public class SlowAndExpiredTrafficStreamBecomesTwoTargetChannelsTest {
         }
 
         @Override
-        public SimpleHttpResponse apply(HttpRequestFirstLine firstLine) {
-            var pathReceived = firstLine.path().getPath();
+        public SimpleHttpResponse apply(HttpRequest firstLine) {
+            var pathReceived = firstLine.getPath().getPath();
             pathsReceivedList.add(pathReceived);
             var payloadBytes = pathReceived.getBytes(StandardCharsets.UTF_8);
             targetRequestsPending.countDown();

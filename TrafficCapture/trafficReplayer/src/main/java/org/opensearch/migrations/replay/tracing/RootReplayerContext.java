@@ -1,13 +1,12 @@
 package org.opensearch.migrations.replay.tracing;
 
-import io.opentelemetry.api.OpenTelemetry;
-
 import org.opensearch.migrations.replay.datatypes.ISourceTrafficChannelKey;
 import org.opensearch.migrations.replay.datatypes.ITrafficStreamKey;
 import org.opensearch.migrations.replay.traffic.source.InputStreamOfTraffic;
 import org.opensearch.migrations.tracing.IContextTracker;
 import org.opensearch.migrations.tracing.RootOtelContext;
 
+import io.opentelemetry.api.OpenTelemetry;
 import lombok.Getter;
 
 @Getter
@@ -33,6 +32,7 @@ public class RootReplayerContext extends RootOtelContext implements IRootReplaye
     public final ReplayContexts.RequestTransformationContext.MetricInstruments transformationInstruments;
     public final ReplayContexts.ScheduledContext.MetricInstruments scheduledInstruments;
     public final ReplayContexts.TargetRequestContext.MetricInstruments targetRequestInstruments;
+    public final ReplayContexts.RequestConnectingContext.MetricInstruments requestConnectingInstruments;
     public final ReplayContexts.RequestSendingContext.MetricInstruments requestSendingInstruments;
     public final ReplayContexts.WaitingForHttpResponseContext.MetricInstruments waitingForHttpResponseInstruments;
     public final ReplayContexts.ReceivingHttpResponseContext.MetricInstruments receivingHttpInstruments;
@@ -63,6 +63,7 @@ public class RootReplayerContext extends RootOtelContext implements IRootReplaye
         transformationInstruments = ReplayContexts.RequestTransformationContext.makeMetrics(meter);
         scheduledInstruments = ReplayContexts.ScheduledContext.makeMetrics(meter);
         targetRequestInstruments = ReplayContexts.TargetRequestContext.makeMetrics(meter);
+        requestConnectingInstruments = ReplayContexts.RequestConnectingContext.makeMetrics(meter);
         requestSendingInstruments = ReplayContexts.RequestSendingContext.makeMetrics(meter);
         waitingForHttpResponseInstruments = ReplayContexts.WaitingForHttpResponseContext.makeMetrics(meter);
         receivingHttpInstruments = ReplayContexts.ReceivingHttpResponseContext.makeMetrics(meter);

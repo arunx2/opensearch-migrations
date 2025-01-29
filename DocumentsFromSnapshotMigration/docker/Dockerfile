@@ -1,8 +1,10 @@
 # Using same base image as other Java containers in this repo
-FROM amazoncorretto:11-al2023-headless
+FROM amazoncorretto:17-al2023-headless
 
 # Install the AWS CLI in the container
-RUN dnf update -y && dnf install -y aws-cli
+RUN dnf install -y aws-cli --setopt=install_weak_deps=False && \
+       dnf clean all && \
+       rm -rf /var/cache/dnf
 
 # Requires Gradle to genearte runtime jars initially
 COPY ./build/runtimeJars /rfs-app/jars

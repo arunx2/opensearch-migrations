@@ -2,11 +2,8 @@ plugins {
   id "java-library"
 }
 
-java.sourceCompatibility = JavaVersion.VERSION_11
-java.targetCompatibility = JavaVersion.VERSION_11
-
-repositories {
-  mavenCentral()
+ext {
+  protobufVersion='3.25.5'
 }
 
 dependencies {
@@ -28,7 +25,7 @@ dependencies {
 
     api group: 'com.google.guava', name: 'guava', version: '32.0.1-jre'
 
-    api group: 'com.google.protobuf', name: 'protobuf-java', version: '3.22.2'
+    api group: 'com.google.protobuf', name: 'protobuf-java', version: protobufVersion
 
     api group: 'org.apache.httpcomponents.client5', name: 'httpclient5', version: '5.2.1'
     api group: 'software.amazon.msk', name:'aws-msk-iam-auth', version: '2.0.3'
@@ -42,23 +39,21 @@ dependencies {
 
     api group: 'org.apache.kafka', name:'kafka-clients', version:'3.6.0'
 
-    api group: 'com.google.protobuf', name: 'protoc', version: '3.22.2'
+    api group: 'com.google.protobuf', name: 'protoc', version: protobufVersion
 
     def jmeter = '5.6.3'
     api group: 'org.apache.jmeter', name: 'ApacheJMeter_core', version: jmeter
     api group: 'org.apache.jmeter', name: 'ApacheJMeter_http', version: jmeter
     api group: 'org.apache.jmeter', name: 'ApacheJMeter_config', version: jmeter
 
-    api group: 'com.beust', name: 'jcommander', version: '1.82'
+    api group: 'org.jcommander', name: 'jcommander', version: '1.85'
 
     api group: 'org.projectlombok', name: 'lombok', version: '1.18.28'
 
-    def resilience4j = '1.7.0'
-    api group: 'io.github.resilience4j', name: 'resilience4j-ratelimiter', version: resilience4j
-    api group: 'io.github.resilience4j', name: 'resilience4j-retry', version: resilience4j
-
     def jackson = '2.16.2'
     api group: 'com.fasterxml.jackson.core', name: 'jackson-databind', version: jackson
+    api group: 'com.fasterxml.jackson.core', name: 'jackson-dataformat-yaml', version: jackson
+    api group: 'com.fasterxml.jackson.dataformat', name: 'jackson-dataformat-yaml', version: jackson
     api group: 'com.fasterxml.jackson.dataformat', name: 'jackson-dataformat-smile', version: jackson
 
     def jupiter = '5.10.2'
@@ -112,14 +107,23 @@ dependencies {
 
     api group: 'eu.rekawek.toxiproxy', name: 'toxiproxy-java', version: '2.1.7'
 
-    def lucene = '8.11.3';
+    def lucene = '9.11.1';
     api group: 'org.apache.lucene', name: 'lucene-core', version: lucene
-    api group: 'org.apache.lucene', name: 'lucene-analyzers-common', version: lucene
+    api group: 'org.apache.lucene', name: 'lucene-analysis-common', version: lucene
     api group: 'org.apache.lucene', name: 'lucene-backward-codecs', version: lucene
 
     api group: 'org.hamcrest', name: 'hamcrest', version: '2.2'
 
     api group: 'org.openjdk.jmh', name: 'jmh-core', version: '1.36'
+
+    api group: 'org.semver4j', name: 'semver4j', version: '5.3.0'
+
+    def json = '20240303'
+    api group: 'org.json', name: 'json', version: json
+
+    def graalVersion = '24.1.1'
+    api group: "org.graalvm.polyglot", name: 'polyglot', version: graalVersion
+    api group: "org.graalvm.polyglot", name: 'js-community', version: graalVersion
 
     // ************************************************************
     // The following constraints are for mitigating transitive CVEs
@@ -132,6 +136,8 @@ dependencies {
     implementation group: 'org.apache.tika', name: 'tika-core', version: '1.28.4'
     implementation group: 'com.jayway.jsonpath', name: 'json-path', version: '2.9.0'
     implementation group: 'dnsjava', name: 'dnsjava', version: '3.6.0'
+    implementation group: 'org.xerial.snappy', name: 'snappy-java', version: '1.1.10.6'
+    api group: 'org.glassfish.jersey.core', name: 'jersey-common', version: '2.34'
     api group: 'org.apache.httpcomponents', 'name': 'httpclient', version: '4.5.13'
 
   }

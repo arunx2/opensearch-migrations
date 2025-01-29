@@ -70,16 +70,16 @@ services:
     networks:
       - migrations
     volumes:
-      - sharedReplayerOutput:/shared-replayer-output
+      - sharedLogsVolume:/shared-logs-output
     environment:
-      - TUPLE_DIR_PATH=/shared-replayer-output/traffic-replayer-default
+      - SHARED_LOGS_DIR_PATH=/shared-logs-output/traffic-replayer-default
     depends_on:
       kafka:
         condition: service_started
       opensearchtarget:
         condition: service_started
-    command: /bin/sh -c "/runJavaWithClasspath.sh org.opensearch.migrations.replay.TrafficReplayer --speedup-factor 2 https://opensearchtarget:9200 --auth-header-value Basic\\ YWRtaW46bXlTdHJvbmdQYXNzd29yZDEyMyE= --insecure --kafka-traffic-brokers kafka:9092 --kafka-traffic-topic logging-traffic-topic --kafka-traffic-group-id logging-group-default --otelCollectorEndpoint http://otel-collector:4317"
-
+#   command: /bin/sh -c "/runJavaWithClasspath.sh org.opensearch.migrations.replay.TrafficReplayer --speedup-factor 2 https://opensearchtarget:9200 --auth-header-value Basic\\ YWRtaW46bXlTdHJvbmdQYXNzd29yZDEyMyE= --insecure --kafka-traffic-brokers kafka:9092 --kafka-traffic-topic logging-traffic-topic --kafka-traffic-group-id logging-group-default --otelCollectorEndpoint http://otel-collector:4317  "
+    command: /bin/sh -c "/runJavaWithClasspath.sh org.opensearch.migrations.replay.TrafficReplayer --speedup-factor 2 https://opensearchtarget:9200 --auth-header-value Basic\\ YWRtaW46bXlTdHJvbmdQYXNzd29yZDEyMyE= --insecure --kafka-traffic-brokers kafka:9092 --kafka-traffic-topic logging-traffic-topic --kafka-traffic-group-id logging-group-default --otelCollectorEndpoint http://otel-collector:4317 --transformer-config '[{\"TypeMappingSanitizationTransformerProvider\":{\"sourceProperties\":{\"version\":{\"major\":7,\"minor\":10}}}}]'"
   opensearchtarget:
     image: 'opensearchproject/opensearch:2.15.0'
     environment:
@@ -96,7 +96,7 @@ services:
     networks:
       - migrations
     volumes:
-      - sharedReplayerOutput:/shared-replayer-output
+      - sharedLogsVolume:/shared-logs-output
       - ./migrationConsole/lib/console_link/services.yaml:/etc/migration_services.yaml
       # this is a convenience thing for testing -- it should be removed before this makes it to prod.
       # - ./migrationConsole/lib/console_link:/root/lib/console_link
@@ -113,7 +113,7 @@ services:
 volumes:
   sharedComparatorSqlResults:
     driver: local
-  sharedReplayerOutput:
+  sharedLogsVolume:
     driver: local
   grafana_data:
     driver: local

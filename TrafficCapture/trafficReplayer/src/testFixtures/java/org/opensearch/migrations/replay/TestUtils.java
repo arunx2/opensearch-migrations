@@ -13,16 +13,15 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.function.IntFunction;
-
-import org.junit.jupiter.api.Assertions;
+import java.util.stream.Collectors;
 
 import org.opensearch.migrations.Utils;
 import org.opensearch.migrations.replay.datahandlers.IPacketConsumer;
 import org.opensearch.migrations.replay.datahandlers.http.HttpJsonTransformingConsumer;
-import org.opensearch.migrations.replay.util.TrackedFuture;
 import org.opensearch.migrations.tracing.TestContext;
 import org.opensearch.migrations.transform.IAuthTransformerFactory;
 import org.opensearch.migrations.transform.IJsonTransformer;
+import org.opensearch.migrations.utils.TrackedFuture;
 
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
@@ -34,6 +33,7 @@ import io.netty.handler.codec.http.HttpContentDecompressor;
 import io.netty.handler.codec.http.HttpObjectAggregator;
 import io.netty.handler.codec.http.HttpRequestDecoder;
 import lombok.extern.slf4j.Slf4j;
+import org.junit.jupiter.api.Assertions;
 
 @Slf4j
 public class TestUtils {
@@ -132,6 +132,9 @@ public class TestUtils {
 
         Assertions.assertEquals((expectedPayloadString), getStringFromContent(fullRequest));
         Assertions.assertEquals(expectedRequestHeaders, fullRequest.headers());
+        // Test casing on keys match
+        Assertions.assertEquals(expectedRequestHeaders.names().stream().sorted().collect(Collectors.toList()),
+            fullRequest.headers().names().stream().sorted().collect(Collectors.toList()));
         fullRequest.release();
     }
 
@@ -169,7 +172,7 @@ public class TestUtils {
     ) throws IOException, ExecutionException, InterruptedException {
         var testPacketCapture = new TestCapturePacketToHttpHandler(
             Duration.ofMillis(100),
-            new AggregatedRawResponse(-1, Duration.ZERO, new ArrayList<>(), null)
+            new AggregatedRawResponse(null, -1, Duration.ZERO, new ArrayList<>(), null)
         );
         var transformingHandler = new HttpJsonTransformingConsumer<>(
             transformer,

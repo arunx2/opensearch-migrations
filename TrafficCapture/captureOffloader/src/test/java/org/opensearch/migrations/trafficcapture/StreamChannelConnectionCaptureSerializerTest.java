@@ -13,15 +13,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutionException;
 
-import com.google.protobuf.ByteString;
-import com.google.protobuf.CodedOutputStream;
-import com.google.protobuf.Timestamp;
-import org.junit.jupiter.api.Assertions;
-import org.junit.jupiter.api.Test;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.CsvSource;
-import org.junit.jupiter.params.provider.ValueSource;
-
 import org.opensearch.migrations.testutils.WrapWithNettyLeakDetection;
 import org.opensearch.migrations.trafficcapture.StreamChannelConnectionCaptureSerializerTest.StreamManager.NullStreamManager;
 import org.opensearch.migrations.trafficcapture.protos.CloseObservation;
@@ -34,11 +25,19 @@ import org.opensearch.migrations.trafficcapture.protos.TrafficStream;
 import org.opensearch.migrations.trafficcapture.protos.WriteObservation;
 import org.opensearch.migrations.trafficcapture.protos.WriteSegmentObservation;
 
+import com.google.protobuf.ByteString;
+import com.google.protobuf.CodedOutputStream;
+import com.google.protobuf.Timestamp;
 import io.netty.buffer.Unpooled;
 import lombok.AllArgsConstructor;
 import lombok.Lombok;
 import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 @Slf4j
 @WrapWithNettyLeakDetection(repetitions = 4)
@@ -49,8 +48,8 @@ class StreamChannelConnectionCaptureSerializerTest {
 
     // Reference Timestamp chosen in the future with nanosecond precision resemble an upper bound on space overhead
     public static final Instant REFERENCE_TIMESTAMP = Instant.parse("2999-01-01T23:59:59.98765432Z");
-    private final static String FAKE_EXCEPTION_DATA = "abcdefghijklmnop";
-    private final static String FAKE_READ_PACKET_DATA = "ABCDEFGHIJKLMNOP";
+    private static final String FAKE_EXCEPTION_DATA = "abcdefghijklmnop";
+    private static final String FAKE_READ_PACKET_DATA = "ABCDEFGHIJKLMNOP";
 
     private static int getEstimatedTrafficStreamByteSize(int readWriteEventCount, int averageDataPacketSize) {
         var fixedTimestamp = Timestamp.newBuilder()
@@ -744,15 +743,13 @@ class StreamChannelConnectionCaptureSerializerTest {
             return CompletableFuture.runAsync(() -> {
                 try {
                     osh.getOutputStream().flush();
-                    log.atTrace().setMessage("Just flushed for {}").addArgument(osh.getOutputStream()).log();
+                    log.atTrace().setMessage("Just flushed for {}").addArgument(osh::getOutputStream).log();
                     var bb = osh.getByteBuffer();
                     bb.position(0);
                     var bytesWritten = osh.getOutputStream().getTotalBytesWritten();
                     bb.limit(bytesWritten);
-                    log.atTrace()
-                        .setMessage("Adding {}")
-                        .addArgument(() -> StandardCharsets.UTF_8.decode(bb.duplicate()))
-                        .log();
+                    log.atTrace().setMessage("Adding {}")
+                        .addArgument(() -> StandardCharsets.UTF_8.decode(bb.duplicate())).log();
                     outputBuffers.add(bb);
                 } catch (IOException e) {
                     throw Lombok.sneakyThrow(e);

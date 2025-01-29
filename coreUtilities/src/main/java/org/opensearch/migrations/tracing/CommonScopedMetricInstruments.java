@@ -7,7 +7,6 @@ import java.util.stream.DoubleStream;
 import io.opentelemetry.api.metrics.DoubleHistogram;
 import io.opentelemetry.api.metrics.LongCounter;
 import io.opentelemetry.api.metrics.Meter;
-
 import lombok.AllArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
@@ -70,12 +69,11 @@ public class CommonScopedMetricInstruments extends CommonMetricInstruments {
     }
 
     private static List<Double> getBuckets(double firstBucketSize, double lastBucketCeiling) {
-        var buckets = getExponentialBucketsBetween(firstBucketSize, lastBucketCeiling, 2.0);
+        var buckets = getExponentialBucketsBetween(firstBucketSize, lastBucketCeiling);
         log.atTrace()
-            .setMessage(
-                () -> "Setting buckets to "
-                    + buckets.stream().map(x -> "" + x).collect(Collectors.joining(",", "[", "]"))
-            )
+            .setMessage("Setting buckets to {}")
+            .addArgument(() -> buckets.stream().map(x -> "" + x)
+                .collect(Collectors.joining(",", "[", "]")))
             .log();
         return buckets;
     }

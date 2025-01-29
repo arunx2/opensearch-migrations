@@ -11,7 +11,26 @@ import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import org.opensearch.migrations.replay.SourceTargetCaptureTuple;
+import org.opensearch.migrations.replay.TestHttpServerContext;
+import org.opensearch.migrations.replay.V0_1TrafficCaptureSource;
+import org.opensearch.migrations.replay.kafka.KafkaTestUtils;
+import org.opensearch.migrations.replay.kafka.KafkaTrafficCaptureSource;
+import org.opensearch.migrations.replay.traffic.generator.ExhaustiveTrafficStreamGenerator;
+import org.opensearch.migrations.replay.traffic.source.ISimpleTrafficCaptureSource;
+import org.opensearch.migrations.replay.traffic.source.ITrafficStreamWithKey;
+import org.opensearch.migrations.testutils.SharedDockerImageNames;
+import org.opensearch.migrations.testutils.SimpleNettyHttpServer;
+import org.opensearch.migrations.testutils.WrapWithNettyLeakDetection;
+import org.opensearch.migrations.tracing.InstrumentationTest;
+import org.opensearch.migrations.tracing.TestContext;
+import org.opensearch.migrations.trafficcapture.protos.TrafficStream;
+import org.opensearch.migrations.trafficcapture.protos.TrafficStreamUtils;
+
 import com.google.common.collect.Streams;
+import lombok.Lombok;
+import lombok.SneakyThrows;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.Producer;
@@ -21,29 +40,9 @@ import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
-
-import org.opensearch.migrations.replay.SourceTargetCaptureTuple;
-import org.opensearch.migrations.replay.TestHttpServerContext;
-import org.opensearch.migrations.replay.V0_1TrafficCaptureSource;
-import org.opensearch.migrations.replay.kafka.KafkaTestUtils;
-import org.opensearch.migrations.replay.kafka.KafkaTrafficCaptureSource;
-import org.opensearch.migrations.replay.traffic.generator.ExhaustiveTrafficStreamGenerator;
-import org.opensearch.migrations.replay.traffic.source.ISimpleTrafficCaptureSource;
-import org.opensearch.migrations.replay.traffic.source.ITrafficStreamWithKey;
-import org.opensearch.migrations.testutils.SimpleNettyHttpServer;
-import org.opensearch.migrations.testutils.WrapWithNettyLeakDetection;
-import org.opensearch.migrations.tracing.InstrumentationTest;
-import org.opensearch.migrations.tracing.TestContext;
-import org.opensearch.migrations.trafficcapture.protos.TrafficStream;
-import org.opensearch.migrations.trafficcapture.protos.TrafficStreamUtils;
-
-import lombok.Lombok;
-import lombok.SneakyThrows;
-import lombok.extern.slf4j.Slf4j;
 import org.testcontainers.containers.KafkaContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
-import org.testcontainers.utility.DockerImageName;
 
 @Slf4j
 @Testcontainers(disabledWithoutDocker = true)
@@ -65,9 +64,7 @@ public class KafkaRestartingTrafficReplayerTest extends InstrumentationTest {
     @Container
     // see
     // https://docs.confluent.io/platform/current/installation/versions-interoperability.html#cp-and-apache-kafka-compatibility
-    private final KafkaContainer embeddedKafkaBroker = new KafkaContainer(
-        DockerImageName.parse("confluentinc/cp-kafka:7.5.0")
-    );
+    private final KafkaContainer embeddedKafkaBroker = new KafkaContainer(SharedDockerImageNames.KAFKA);
 
     private static class CounterLimitedReceiverFactory implements Supplier<Consumer<SourceTargetCaptureTuple>> {
         AtomicInteger nextStopPointRef = new AtomicInteger(INITIAL_STOP_REPLAYER_REQUEST_COUNT);
@@ -107,11 +104,10 @@ public class KafkaRestartingTrafficReplayerTest extends InstrumentationTest {
                 randomize
             );
             var trafficStreams = streamAndConsumer.stream.collect(Collectors.toList());
-            log.atInfo()
-                .setMessage(
-                    () -> trafficStreams.stream()
-                        .map(TrafficStreamUtils::summarizeTrafficStream)
-                        .collect(Collectors.joining("\n"))
+            log.atInfo().setMessage("{}")
+                .addArgument(() -> trafficStreams.stream()
+                    .map(TrafficStreamUtils::summarizeTrafficStream)
+                    .collect(Collectors.joining("\n"))
                 )
                 .log();
 
@@ -148,7 +144,7 @@ public class KafkaRestartingTrafficReplayerTest extends InstrumentationTest {
         );
         kafkaConsumerProps.setProperty("max.poll.interval.ms", DEFAULT_POLL_INTERVAL_MS + "");
         var kafkaConsumer = new KafkaConsumer<String, byte[]>(kafkaConsumerProps);
-        log.atInfo().setMessage(() -> "Just built KafkaConsumer=" + kafkaConsumer).log();
+        log.atInfo().setMessage("Just built KafkaConsumer={}").addArgument(kafkaConsumer).log();
         return kafkaConsumer;
     }
 

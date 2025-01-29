@@ -14,7 +14,7 @@ import lombok.extern.slf4j.Slf4j;
 @Slf4j
 public class NettyJsonContentAuthSigner extends ChannelInboundHandlerAdapter {
     IAuthTransformer.StreamingFullMessageTransformer signer;
-    HttpJsonMessageWithFaultingPayload httpMessage;
+    HttpJsonRequestWithFaultingPayload httpMessage;
     List<HttpContent> httpContentsBuffer;
 
     public NettyJsonContentAuthSigner(IAuthTransformer.StreamingFullMessageTransformer signer) {
@@ -25,8 +25,8 @@ public class NettyJsonContentAuthSigner extends ChannelInboundHandlerAdapter {
 
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-        if (msg instanceof HttpJsonMessageWithFaultingPayload) {
-            httpMessage = (HttpJsonMessageWithFaultingPayload) msg;
+        if (msg instanceof HttpJsonRequestWithFaultingPayload) {
+            httpMessage = (HttpJsonRequestWithFaultingPayload) msg;
         } else if (msg instanceof HttpContent) {
             var httpContent = (HttpContent) msg;
             httpContentsBuffer.add(httpContent);
@@ -55,12 +55,8 @@ public class NettyJsonContentAuthSigner extends ChannelInboundHandlerAdapter {
     public void handlerRemoved(ChannelHandlerContext ctx) throws Exception {
         boolean messageFlushed = flushDownstream(ctx);
         if (messageFlushed) {
-            log.atWarn()
-                .setMessage(
-                    () -> "Failed to sign message due to handler removed"
-                        + " before the end of the http contents were received"
-                )
-                .log();
+            log.atWarn().setMessage("Failed to sign message due to handler removed " +
+                    "before the end of the http contents were received").log();
         }
         super.handlerRemoved(ctx);
     }
@@ -70,11 +66,8 @@ public class NettyJsonContentAuthSigner extends ChannelInboundHandlerAdapter {
         boolean messageFlushed = flushDownstream(ctx);
         if (messageFlushed) {
             log.atWarn()
-                .setMessage(
-                    () -> "Failed to sign message due to channel unregistered"
-                        + " before the end of the http contents were received"
-                )
-                .log();
+                .setMessage("Failed to sign message due to channel unregistered"
+                        + " before the end of the http contents were received").log();
         }
         super.channelUnregistered(ctx);
     }

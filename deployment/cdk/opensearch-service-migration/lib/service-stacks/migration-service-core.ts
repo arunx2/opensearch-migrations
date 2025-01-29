@@ -1,7 +1,6 @@
 import {StackPropsExt} from "../stack-composer";
 import {ISecurityGroup, IVpc, SubnetType} from "aws-cdk-lib/aws-ec2";
 import {
-    CfnService as FargateCfnService,
     Cluster,
     ContainerImage, CpuArchitecture,
     FargateService,
@@ -14,12 +13,12 @@ import {
     Volume,
     AwsLogDriverMode,
     ContainerDependencyCondition,
+    ServiceManagedVolume
 } from "aws-cdk-lib/aws-ecs";
-import {DockerImageAsset} from "aws-cdk-lib/aws-ecr-assets";
 import {Duration, RemovalPolicy, Stack} from "aws-cdk-lib";
 import {LogGroup, RetentionDays} from "aws-cdk-lib/aws-logs";
-import {PolicyStatement} from "aws-cdk-lib/aws-iam";
-import {createDefaultECSTaskRole} from "../common-utilities";
+import {PolicyStatement, Role} from "aws-cdk-lib/aws-iam";
+import {createDefaultECSTaskRole, makeLocalAssetContainerImage} from "../common-utilities";
 import {OtelCollectorSidecar} from "./migration-otel-collector-sidecar";
 import { IApplicationTargetGroup, INetworkTargetGroup } from "aws-cdk-lib/aws-elasticloadbalancingv2";
 
@@ -29,20 +28,14 @@ export interface MigrationServiceCoreProps extends StackPropsExt {
     readonly vpc: IVpc,
     readonly securityGroups: ISecurityGroup[],
     readonly cpuArchitecture: CpuArchitecture,
-    readonly dockerFilePath?: string,
-    readonly dockerDirectoryPath?: string,
-    readonly dockerImageRegistryName?: string,
+    readonly dockerImageName: string,
     readonly dockerImageCommand?: string[],
-    readonly dockerBuildArgs?: {
-        [key: string]: string
-    },
+    readonly taskRole?: Role,
     readonly taskRolePolicies?: PolicyStatement[],
     readonly mountPoints?: MountPoint[],
     readonly volumes?: Volume[],
     readonly portMappings?: PortMapping[],
-    readonly environment?: {
-        [key: string]: string;
-    },
+    readonly environment?: Record<string, string>,
     readonly taskCpuUnits?: number,
     readonly taskMemoryLimitMiB?: number,
     readonly taskInstanceCount?: number,
@@ -56,22 +49,19 @@ export interface MigrationServiceCoreProps extends StackPropsExt {
 export type ELBTargetGroup = IApplicationTargetGroup | INetworkTargetGroup;
 
 export class MigrationServiceCore extends Stack {
+    serviceTaskRole: Role;
 
     createService(props: MigrationServiceCoreProps) {
-        if ((!props.dockerDirectoryPath && !props.dockerImageRegistryName) || (props.dockerDirectoryPath && props.dockerImageRegistryName)) {
-            throw new Error(`Exactly one option [dockerDirectoryPath, dockerImageRegistryName] is required to create the "${props.serviceName}" service`)
-        }
-
         const ecsCluster = Cluster.fromClusterAttributes(this, 'ecsCluster', {
             clusterName: `migration-${props.stage}-ecs-cluster`,
             vpc: props.vpc
         })
 
-        const serviceTaskRole = createDefaultECSTaskRole(this, props.serviceName)
-        props.taskRolePolicies?.forEach(policy => serviceTaskRole.addToPolicy(policy))
+        this.serviceTaskRole = props.taskRole ? props.taskRole : createDefaultECSTaskRole(this, props.serviceName)
+        props.taskRolePolicies?.forEach(policy => this.serviceTaskRole.addToPolicy(policy))
 
         const serviceTaskDef = new FargateTaskDefinition(this, "ServiceTaskDef", {
-            ephemeralStorageGiB: props.ephemeralStorageGiB ? props.ephemeralStorageGiB : 75,
+            ephemeralStorageGiB: Math.max(props.ephemeralStorageGiB ? props.ephemeralStorageGiB : 75, 21), // valid values 21 - 200
             runtimePlatform: {
                 operatingSystemFamily: OperatingSystemFamily.LINUX,
                 cpuArchitecture: props.cpuArchitecture
@@ -79,25 +69,13 @@ export class MigrationServiceCore extends Stack {
             family: `migration-${props.stage}-${props.serviceName}`,
             memoryLimitMiB: props.taskMemoryLimitMiB ? props.taskMemoryLimitMiB : 1024,
             cpu: props.taskCpuUnits ? props.taskCpuUnits : 256,
-            taskRole: serviceTaskRole
+            taskRole: this.serviceTaskRole
         });
         if (props.volumes) {
             props.volumes.forEach(vol => serviceTaskDef.addVolume(vol))
         }
 
-        let serviceImage
-        if (props.dockerDirectoryPath) {
-            serviceImage = ContainerImage.fromDockerImageAsset(new DockerImageAsset(this, "ServiceImage", {
-                directory: props.dockerDirectoryPath,
-                buildArgs: props.dockerBuildArgs,
-                // File path relative to above directory path
-                file: props.dockerFilePath
-            }))
-        }
-        else {
-            // @ts-ignore
-            serviceImage = ContainerImage.fromRegistry(props.dockerImageRegistryName)
-        }
+        const serviceImage = makeLocalAssetContainerImage(this, props.dockerImageName)
 
         const serviceLogGroup = new LogGroup(this, 'ServiceLogGroup',  {
             retention: RetentionDays.ONE_MONTH,
@@ -129,7 +107,7 @@ export class MigrationServiceCore extends Stack {
         }
 
         if (props.maxUptime) {
-            let maxUptimeSeconds = Math.max(props.maxUptime.toSeconds(), Duration.minutes(5).toSeconds());
+            const maxUptimeSeconds = Math.max(props.maxUptime.toSeconds(), Duration.minutes(5).toSeconds());
 
             // This sets the minimum time that a task should be running before considering it healthy.
             // This is needed because we don't have health checks configured for our service containers.
@@ -137,11 +115,11 @@ export class MigrationServiceCore extends Stack {
             // between the current task being shutdown and the new task being ready to take work. This means
             // health checks for this container will fail initially and startPeriod will stop ECS from treating
             // failing health checks as unhealthy during this period.
-            let startupPeriodSeconds = 30;
+            const startupPeriodSeconds = 30;
             // Add a separate container to monitor and fail healthcheck after a given maxUptime
             const maxUptimeContainer = serviceTaskDef.addContainer("MaxUptimeContainer", {
-                image: ContainerImage.fromRegistry("public.ecr.aws/amazonlinux/amazonlinux:2023-minimal"), 
-                memoryLimitMiB: 64, 
+                image: ContainerImage.fromRegistry("public.ecr.aws/amazonlinux/amazonlinux:2023-minimal"),
+                memoryLimitMiB: 64,
                 entryPoint: [
                     "/bin/sh",
                     "-c",
@@ -185,7 +163,12 @@ export class MigrationServiceCore extends Stack {
             securityGroups: props.securityGroups,
             vpcSubnets: props.vpc.selectSubnets({subnetType: SubnetType.PRIVATE_WITH_EGRESS}),
         });
-        
+
+        // Add any ServiceManagedVolumes to the service, if they exist
+        if (props.volumes) {
+            props.volumes.filter(vol => vol instanceof ServiceManagedVolume).forEach(vol => fargateService.addVolume(vol as ServiceManagedVolume));
+        }
+
         if (props.targetGroups) {
             props.targetGroups.filter(tg => tg !== undefined).forEach(tg => tg.addTarget(fargateService));
         }

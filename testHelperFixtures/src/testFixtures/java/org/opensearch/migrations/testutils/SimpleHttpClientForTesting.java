@@ -11,6 +11,7 @@ import java.util.Map;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import lombok.AllArgsConstructor;
 import org.apache.hc.client5.http.classic.methods.HttpGet;
 import org.apache.hc.client5.http.classic.methods.HttpPut;
 import org.apache.hc.client5.http.config.RequestConfig;
@@ -28,8 +29,6 @@ import org.apache.hc.core5.http.io.entity.InputStreamEntity;
 import org.apache.hc.core5.ssl.SSLContexts;
 import org.apache.hc.core5.util.Timeout;
 
-import lombok.AllArgsConstructor;
-
 /**
  * This is an HTTP client that is capable of making GET requests (developers are
  * encouraged to extend this) to either hosts that may be using TLS with a self=signed
@@ -37,8 +36,8 @@ import lombok.AllArgsConstructor;
  */
 public class SimpleHttpClientForTesting implements AutoCloseable {
 
-    private final static Timeout DEFAULT_RESPONSE_TIMEOUT = Timeout.ofSeconds(5);
-    private final static Timeout DEFAULT_CONNECTION_TIMEOUT = Timeout.ofSeconds(5);
+    private static final Timeout DEFAULT_RESPONSE_TIMEOUT = Timeout.ofSeconds(5);
+    private static final Timeout DEFAULT_CONNECTION_TIMEOUT = Timeout.ofSeconds(5);
 
     private final CloseableHttpClient httpClient;
 

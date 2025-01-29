@@ -1,26 +1,29 @@
 import {StackPropsExt} from "../stack-composer";
 import {IVpc, SecurityGroup} from "aws-cdk-lib/aws-ec2";
-import {CpuArchitecture, MountPoint, Volume} from "aws-cdk-lib/aws-ecs";
+import {CpuArchitecture} from "aws-cdk-lib/aws-ecs";
 import {Construct} from "constructs";
-import {join} from "path";
 import {MigrationServiceCore} from "./migration-service-core";
 import {Effect, PolicyStatement} from "aws-cdk-lib/aws-iam";
 import {
+    ClusterAuth,
     MigrationSSMParameter,
     createMSKConsumerIAMPolicies,
     createOpenSearchIAMAccessPolicy,
     createOpenSearchServerlessIAMAccessPolicy,
-    getMigrationStringParameterValue, parseAndMergeArgs
+    getMigrationStringParameterValue, appendArgIfNotInExtraArgs, parseArgsToDict
 } from "../common-utilities";
 import {StreamingSourceType} from "../streaming-source-type";
-import { Duration } from "aws-cdk-lib";
+import {Duration, SecretValue} from "aws-cdk-lib";
 import {OtelCollectorSidecar} from "./migration-otel-collector-sidecar";
 import { ECSReplayerYaml } from "../migration-services-yaml";
+import { SharedLogFileSystem } from "../components/shared-log-file-system";
+import {Secret} from "aws-cdk-lib/aws-secretsmanager";
+import { CdkLogger } from "../cdk-logger";
 
 
 export interface TrafficReplayerProps extends StackPropsExt {
     readonly vpc: IVpc,
-    readonly enableClusterFGACAuth: boolean,
+    readonly clusterAuthDetails: ClusterAuth,
     readonly streamingSourceType: StreamingSourceType,
     readonly fargateCpuArch: CpuArchitecture,
     readonly addOnMigrationId?: string,
@@ -37,11 +40,11 @@ export class TrafficReplayerStack extends MigrationServiceCore {
     constructor(scope: Construct, id: string, props: TrafficReplayerProps) {
         super(scope, id, props)
 
-        let securityGroups = [
+        const securityGroups = [
             { id: "serviceSG", param: MigrationSSMParameter.SERVICE_SECURITY_GROUP_ID },
             { id: "trafficStreamSourceAccessSG", param: MigrationSSMParameter.TRAFFIC_STREAM_SOURCE_ACCESS_SECURITY_GROUP_ID },
             { id: "defaultDomainAccessSG", param: MigrationSSMParameter.OS_ACCESS_SECURITY_GROUP_ID },
-            { id: "replayerOutputAccessSG", param: MigrationSSMParameter.REPLAYER_OUTPUT_ACCESS_SECURITY_GROUP_ID }
+            { id: "sharedLogsAccessSG", param: MigrationSSMParameter.SHARED_LOGS_SECURITY_GROUP_ID }
         ].map(({ id, param }) =>
             SecurityGroup.fromSecurityGroupId(this, id, getMigrationStringParameterValue(this, {
                 ...props,
@@ -49,32 +52,8 @@ export class TrafficReplayerStack extends MigrationServiceCore {
             }))
         );
 
-        const volumeName = "sharedReplayerOutputVolume"
-        const volumeId = getMigrationStringParameterValue(this, {
-            ...props,
-            parameter: MigrationSSMParameter.REPLAYER_OUTPUT_EFS_ID,
-        })
-        const replayerOutputEFSVolume: Volume = {
-            name: volumeName,
-            efsVolumeConfiguration: {
-                fileSystemId: volumeId,
-                transitEncryption: "ENABLED"
-            }
-        };
-        const replayerOutputMountPoint: MountPoint = {
-            containerPath: "/shared-replayer-output",
-            readOnly: false,
-            sourceVolume: volumeName
-        }
-        const replayerOutputEFSArn = `arn:${this.partition}:elasticfilesystem:${this.region}:${this.account}:file-system/${volumeId}`
-        const replayerOutputMountPolicy = new PolicyStatement( {
-            effect: Effect.ALLOW,
-            resources: [replayerOutputEFSArn],
-            actions: [
-                "elasticfilesystem:ClientMount",
-                "elasticfilesystem:ClientWrite"
-            ]
-        })
+        const sharedLogFileSystem = new SharedLogFileSystem(this, props.stage, props.defaultDeployId);
+
 
         const secretAccessPolicy = new PolicyStatement({
             effect: Effect.ALLOW,
@@ -86,7 +65,7 @@ export class TrafficReplayerStack extends MigrationServiceCore {
         })
         const openSearchPolicy = createOpenSearchIAMAccessPolicy(this.partition, this.region, this.account)
         const openSearchServerlessPolicy = createOpenSearchServerlessIAMAccessPolicy(this.partition, this.region, this.account)
-        let servicePolicies = [replayerOutputMountPolicy, secretAccessPolicy, openSearchPolicy, openSearchServerlessPolicy]
+        let servicePolicies = [sharedLogFileSystem.asPolicyStatement(), secretAccessPolicy, openSearchPolicy, openSearchServerlessPolicy]
         if (props.streamingSourceType === StreamingSourceType.AWS_MSK) {
             const mskConsumerPolicies = createMSKConsumerIAMPolicies(this, this.partition, this.region, this.account, props.stage, props.defaultDeployId)
             servicePolicies = servicePolicies.concat(mskConsumerPolicies)
@@ -103,30 +82,59 @@ export class TrafficReplayerStack extends MigrationServiceCore {
         });
         const groupId = props.customKafkaGroupId ? props.customKafkaGroupId : `logging-group-${deployId}`
 
-        let replayerCommand = `/runJavaWithClasspath.sh org.opensearch.migrations.replay.TrafficReplayer ${osClusterEndpoint} --insecure --kafka-traffic-brokers ${brokerEndpoints} --kafka-traffic-topic logging-traffic-topic --kafka-traffic-group-id ${groupId}`
-        if (props.enableClusterFGACAuth) {
-            const osUserAndSecret = getMigrationStringParameterValue(this, {
-                ...props,
-                parameter: MigrationSSMParameter.OS_USER_AND_SECRET_ARN,
-            });
-            replayerCommand = replayerCommand.concat(` --auth-header-user-and-secret ${osUserAndSecret}`)
+        let command = `/runJavaWithClasspath.sh org.opensearch.migrations.replay.TrafficReplayer ${osClusterEndpoint}`
+        const extraArgsDict = parseArgsToDict(props.extraArgs)
+        command = appendArgIfNotInExtraArgs(command, extraArgsDict, "--insecure")
+        command = appendArgIfNotInExtraArgs(command, extraArgsDict, "--kafka-traffic-brokers", brokerEndpoints)
+        command = appendArgIfNotInExtraArgs(command, extraArgsDict, "--kafka-traffic-topic", "logging-traffic-topic")
+        command = appendArgIfNotInExtraArgs(command, extraArgsDict, "--kafka-traffic-group-id", groupId)
+
+        if (props.clusterAuthDetails.basicAuth) {
+            let secret;
+            if (props.clusterAuthDetails.basicAuth.password) {
+                CdkLogger.warn("Password passed in plain text, this is insecure and will leave" +
+                    "your password exposed.")
+                secret = new Secret(this,"ReplayerClusterPasswordSecret", {
+                    secretName: `replayer-user-secret-${props.stage}-${deployId}`,
+                    secretStringValue: SecretValue.unsafePlainText(props.clusterAuthDetails.basicAuth.password)
+                })
+            } else if (props.clusterAuthDetails.basicAuth.password_from_secret_arn) {
+                secret = Secret.fromSecretCompleteArn(this, "ReplayerClusterPasswordSecretImport",
+                props.clusterAuthDetails.basicAuth.password_from_secret_arn)
+            } else {
+                throw new Error("Replayer secret or password must be provided if using basic auth.")
+            }
+
+            const bashSafeUserAndSecret = `"${props.clusterAuthDetails.basicAuth.username}" "${secret.secretArn}"`
+            command = appendArgIfNotInExtraArgs(command, extraArgsDict, "--auth-header-user-and-secret", bashSafeUserAndSecret)
         }
-        replayerCommand = props.streamingSourceType === StreamingSourceType.AWS_MSK ? replayerCommand.concat(" --kafka-traffic-enable-msk-auth") : replayerCommand
-        replayerCommand = props.userAgentSuffix ? replayerCommand.concat(` --user-agent ${props.userAgentSuffix}`) : replayerCommand
-        replayerCommand = props.otelCollectorEnabled ? replayerCommand.concat(` --otelCollectorEndpoint ${OtelCollectorSidecar.getOtelLocalhostEndpoint()}`) : replayerCommand
-        replayerCommand = parseAndMergeArgs(replayerCommand, props.extraArgs);
+
+        if (props.streamingSourceType === StreamingSourceType.AWS_MSK) {
+            command = appendArgIfNotInExtraArgs(command, extraArgsDict, "--kafka-traffic-enable-msk-auth")
+        }
+        if (props.userAgentSuffix) {
+            command = appendArgIfNotInExtraArgs(command, extraArgsDict, "--user-agent", `"${props.userAgentSuffix}"`)
+        }
+        if (props.clusterAuthDetails.sigv4) {
+            const sigv4AuthHeaderServiceRegion = `${props.clusterAuthDetails.sigv4.serviceSigningName},${props.clusterAuthDetails.sigv4.region}`
+            command = appendArgIfNotInExtraArgs(command, extraArgsDict, "--sigv4-auth-header-service-region", sigv4AuthHeaderServiceRegion)
+        }
+        if (props.otelCollectorEnabled) {
+            command = appendArgIfNotInExtraArgs(command, extraArgsDict, "--otelCollectorEndpoint", OtelCollectorSidecar.getOtelLocalhostEndpoint())
+        }
+        command = props.extraArgs?.trim() ? command.concat(` ${props.extraArgs?.trim()}`) : command
 
         this.createService({
             serviceName: `traffic-replayer-${deployId}`,
             taskInstanceCount: 0,
-            dockerDirectoryPath: join(__dirname, "../../../../../", "TrafficCapture/dockerSolution/build/docker/trafficReplayer"),
-            dockerImageCommand: ['/bin/sh', '-c', replayerCommand],
+            dockerImageName: "migrations/traffic_replayer:latest",
+            dockerImageCommand: ['/bin/sh', '-c', command],
             securityGroups: securityGroups,
-            volumes: [replayerOutputEFSVolume],
-            mountPoints: [replayerOutputMountPoint],
+            volumes: [sharedLogFileSystem.asVolume()],
+            mountPoints: [sharedLogFileSystem.asMountPoint()],
             taskRolePolicies: servicePolicies,
             environment: {
-                "TUPLE_DIR_PATH": `/shared-replayer-output/traffic-replayer-${deployId}`
+                "SHARED_LOGS_DIR_PATH": `${sharedLogFileSystem.mountPointPath}/traffic-replayer-${deployId}`
             },
             cpuArchitecture: props.fargateCpuArch,
             taskCpuUnits: 1024,

@@ -9,12 +9,6 @@ import java.time.Instant;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.IntStream;
 
-import com.google.protobuf.ByteOutput;
-import com.google.protobuf.CodedOutputStream;
-import com.google.protobuf.Descriptors;
-import com.google.protobuf.Timestamp;
-import com.google.protobuf.WireFormat;
-
 import org.opensearch.migrations.trafficcapture.protos.CloseObservation;
 import org.opensearch.migrations.trafficcapture.protos.ConnectionExceptionObservation;
 import org.opensearch.migrations.trafficcapture.protos.EndOfMessageIndication;
@@ -27,6 +21,11 @@ import org.opensearch.migrations.trafficcapture.protos.TrafficStream;
 import org.opensearch.migrations.trafficcapture.protos.WriteObservation;
 import org.opensearch.migrations.trafficcapture.protos.WriteSegmentObservation;
 
+import com.google.protobuf.ByteOutput;
+import com.google.protobuf.CodedOutputStream;
+import com.google.protobuf.Descriptors;
+import com.google.protobuf.Timestamp;
+import com.google.protobuf.WireFormat;
 import io.netty.buffer.ByteBuf;
 import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
@@ -124,10 +123,10 @@ public class StreamChannelConnectionCaptureSerializer<T> implements IChannelConn
         } else {
             currentCodedOutputStreamHolderOrNull = streamManager.createStream();
             var currentCodedOutputStream = currentCodedOutputStreamHolderOrNull.getOutputStream();
-            // e.g. 1: "9a25a4fffe620014-00034cfa-00000001-d208faac76346d02-864e38e2"
+            // e.g. <pre> 1: "9a25a4fffe620014-00034cfa-00000001-d208faac76346d02-864e38e2" </pre>
             currentCodedOutputStream.writeString(TrafficStream.CONNECTIONID_FIELD_NUMBER, connectionIdString);
             if (nodeIdString != null) {
-                // e.g. 5: "5ae27fca-0ac4-11ee-be56-0242ac120002"
+                // e.g. <pre> 5: "5ae27fca-0ac4-11ee-be56-0242ac120002" </pre>
                 currentCodedOutputStream.writeString(TrafficStream.NODEID_FIELD_NUMBER, nodeIdString);
             }
             if (eomsSoFar > 0) {
@@ -213,11 +212,11 @@ public class StreamChannelConnectionCaptureSerializer<T> implements IChannelConn
                 numFlushesSoFar + 1
             )
         );
-        // e.g. 2 {
+        // e.g. <pre> 2 { </pre>
         writeTrafficStreamTag(TrafficStream.SUBSTREAM_FIELD_NUMBER);
         // Write observation content length
         getOrCreateCodedOutputStream().writeUInt32NoTag(observationContentSize);
-        // e.g. 1 { 1: 1234 2: 1234 }
+        // e.g. <pre> 1 { 1: 1234 2: 1234 } </pre>
         writeTimestampForNowToCurrentStream(timestamp);
     }
 
@@ -371,7 +370,7 @@ public class StreamChannelConnectionCaptureSerializer<T> implements IChannelConn
             lengthSize = CodedOutputStream.computeInt32SizeNoTag(dataSize);
         }
         beginSubstreamObservation(timestamp, captureFieldNumber, dataSize + lengthSize);
-        // e.g. 4 {
+        // e.g. <pre> 4 { </pre>
         writeObservationTag(captureFieldNumber);
         if (dataSize > 0) {
             getOrCreateCodedOutputStream().writeInt32NoTag(dataSize);
@@ -461,7 +460,7 @@ public class StreamChannelConnectionCaptureSerializer<T> implements IChannelConn
             captureClosureLength = CodedOutputStream.computeInt32SizeNoTag(dataSize + segmentCountSize);
         }
         beginSubstreamObservation(timestamp, captureFieldNumber, captureClosureLength + dataSize + segmentCountSize);
-        // e.g. 4 {
+        // e.g. <pre> 4 {  </pre>
         writeObservationTag(captureFieldNumber);
         if (dataSize > 0) {
             // Write size of data after capture tag
@@ -578,7 +577,7 @@ public class StreamChannelConnectionCaptureSerializer<T> implements IChannelConn
         );
         int eomDataSize = eomPairSize + CodedOutputStream.computeInt32SizeNoTag(eomPairSize);
         beginSubstreamObservation(timestamp, TrafficObservation.ENDOFMESSAGEINDICATOR_FIELD_NUMBER, eomDataSize);
-        // e.g. 15 {
+        // e.g. <pre> 15 { </pre>
         writeObservationTag(TrafficObservation.ENDOFMESSAGEINDICATOR_FIELD_NUMBER);
         getOrCreateCodedOutputStream().writeUInt32NoTag(eomPairSize);
         getOrCreateCodedOutputStream().writeInt32(
@@ -650,6 +649,8 @@ public class StreamChannelConnectionCaptureSerializer<T> implements IChannelConn
         }
 
         @Override
-        public void close() {}
+        public void close() {
+            // No resources to close
+        }
     }
 }

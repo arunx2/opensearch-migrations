@@ -3,11 +3,10 @@ import { OpenSearchDomainStack } from "../lib/opensearch-domain-stack";
 import { createStackComposer, createStackComposerOnlyPassedContext } from "./test-utils";
 import { App } from "aws-cdk-lib";
 import { StackComposer } from "../lib/stack-composer";
-import { KafkaStack } from "../lib";
+import { KafkaStack, MigrationConsoleStack } from "../lib";
 import { describe, beforeEach, afterEach, test, expect, jest } from '@jest/globals';
 import { ContainerImage } from "aws-cdk-lib/aws-ecs";
 
-jest.mock('aws-cdk-lib/aws-ecr-assets');
 describe('Stack Composer Tests', () => {
   beforeEach(() => {
     jest.spyOn(ContainerImage, 'fromDockerImageAsset').mockImplementation(() => ContainerImage.fromRegistry("ServiceImage"));
@@ -17,7 +16,6 @@ describe('Stack Composer Tests', () => {
     jest.clearAllMocks();
     jest.resetModules();
     jest.restoreAllMocks();
-    jest.resetAllMocks();
   });
 
   test('Test empty string provided for a parameter which has a default value, uses the default value', () => {
@@ -32,6 +30,78 @@ describe('Stack Composer Tests', () => {
     domainTemplate.resourceCountIs("AWS::OpenSearchService::Domain", 1)
   })
 
+  function testManagedServiceSourceSnapshot(
+    { sourceAuth, additionalOptions }: { sourceAuth: Record<string, unknown>; additionalOptions: Record<string, unknown> },
+    expectedRoleCount: number,
+    description: string
+  ) {
+    test(description, () => {
+      const contextOptions = {
+        sourceCluster: {
+          "endpoint": "https://test-cluster",
+          "auth": sourceAuth,
+          "version": "ES_7.10"
+        },
+        targetCluster: {
+          "endpoint": "https://test-cluster",
+          "auth": {"type": "none"},
+          "version": "OS_1.3"
+        },
+        vpcEnabled: true,
+        migrationConsoleServiceEnabled: true,
+        migrationAssistanceEnabled: true,
+        reindexFromSnapshotServiceEnabled: true,
+        ...additionalOptions
+      };
+
+      const openSearchStacks = createStackComposer(contextOptions);
+      const migrationConsoleStack = openSearchStacks.stacks.filter((s) => s instanceof MigrationConsoleStack)[0];
+      const migrationConsoleTemplate = Template.fromStack(migrationConsoleStack);
+      migrationConsoleTemplate.resourceCountIs("AWS::IAM::Role", expectedRoleCount);
+      if (expectedRoleCount === 3) {
+        migrationConsoleTemplate.hasResourceProperties("AWS::IAM::Role", {
+          RoleName: "OSMigrations-unit-test-us-east-1-default-SnapshotRole"
+        });
+      }
+    });
+  }
+
+  const sigv4Auth = {
+    "type": "sigv4",
+    "region": "us-east-1",
+    "serviceSigningName": "es"
+  };
+
+  const noAuth = {"type": "none"};
+
+  testManagedServiceSourceSnapshot(
+    {
+      sourceAuth: sigv4Auth,
+      additionalOptions: {}
+    },
+    3,
+    'Test sigv4 source cluster with no managedServiceSourceSnapshotEnabled, defaults to true'
+  );
+
+  testManagedServiceSourceSnapshot(
+    {
+      sourceAuth: sigv4Auth,
+      additionalOptions: { managedServiceSourceSnapshotEnabled: false }
+    },
+    2,
+    'Test sigv4 source cluster with false managedServiceSourceSnapshotEnabled, does not create snapshot role'
+  );
+
+  testManagedServiceSourceSnapshot(
+    {
+      sourceAuth: noAuth,
+      additionalOptions: {}
+    },
+    2,
+    'Test no auth source cluster with no managedServiceSourceSnapshotEnabled, defaults to false'
+  );
+
+
   test('Test invalid engine version format throws error', () => {
     const contextOptions = {
       // Should be OS_1.3
@@ -43,7 +113,7 @@ describe('Stack Composer Tests', () => {
     expect(createStackFunc).toThrow()
   })
 
-  test('Test ES 7.10 engine version format is parsed', () => {
+  test('Test ES_7.10 engine version format is parsed', () => {
     const contextOptions = {
       engineVersion: "ES_7.10"
     }
@@ -217,7 +287,11 @@ describe('Stack Composer Tests', () => {
       migrationAssistanceEnabled: true,
       vpcEnabled: true,
       migrationConsoleServiceEnabled: true,
-      sourceClusterEndpoint: "https://test-cluster",
+      sourceCluster: {
+        "endpoint": "https://test-cluster",
+        "auth": {"type": "none"},
+        "version": "ES_7.10"
+      }
     }
 
     const openSearchStacks = createStackComposer(contextOptions)
@@ -270,7 +344,9 @@ describe('Stack Composer Tests', () => {
 
   test('Test that a context with no source cluster details succeeds if sourceClusterDisabled', () => {
     const sourceClusterDisabledContextOptions = {
-      sourceClusterDisabled: true,
+      sourceCluster: {
+        "disabled": true
+      },
       otelCollectorEnabled: true,
       migrationAssistanceEnabled: true,
       vpcEnabled: true,
@@ -281,7 +357,6 @@ describe('Stack Composer Tests', () => {
     expect(openSearchStacks.stacks).toHaveLength(4)
 
     const sourceClusterNotExplicitlyDisabledContextOptions = {
-      sourceClusterDisabled: false,
       otelCollectorEnabled: true,
       migrationAssistanceEnabled: true,
       vpcEnabled: true,
@@ -291,14 +366,38 @@ describe('Stack Composer Tests', () => {
     expect(sourceClusterNotExplicitlyDisabledCreateStackFunc).toThrow()
 
     const sourceClusterDisabledWithEndpointContextOptions = {
-      sourceClusterDisabled: true,
-      sourceClusterEndpoint: "XXXXXXXXXXXXXXXXXXXX",
+      sourceClusterDisabled: {
+        "disabled": true,
+        "endpoint": "XXXXXXXXXXXXXXXXXXXX"
+      },
       otelCollectorEnabled: true,
       migrationAssistanceEnabled: true,
       vpcEnabled: true,
       migrationConsoleServiceEnabled: true
     }
-    let sourceClusterDisabledWithEndpointCreateStackFunc = () => createStackComposer(sourceClusterDisabledWithEndpointContextOptions)
+    const sourceClusterDisabledWithEndpointCreateStackFunc = () => createStackComposer(sourceClusterDisabledWithEndpointContextOptions)
     expect (sourceClusterDisabledWithEndpointCreateStackFunc).toThrow()
   })
+
+
+  test('Test backwards compatibility of source/target cluster params', () => {
+    // This is effectively a smoke test with the "old-style" flat source and target cluster parameters.
+    const contextOptions = {
+      vpcEnabled: true,
+      migrationAssistanceEnabled: true,
+      migrationConsoleServiceEnabled: true,
+      sourceClusterEndpoint: "https://test-cluster",
+      reindexFromSnapshotServiceEnabled: true,
+      trafficReplayerServiceEnabled: true,
+      fineGrainedManagerUserName: "admin",
+      fineGrainedManagerUserSecretManagerKeyARN: "arn:aws:secretsmanager:us-east-1:12345678912:secret:master-user-os-pass-123abc",
+      nodeToNodeEncryptionEnabled: true, // required if FGAC is being used
+      encryptionAtRestEnabled: true, // required if FGAC is being used
+      enforceHTTPS: true // required if FGAC is being used
+  }
+
+    const stacks = createStackComposer(contextOptions)
+    expect(stacks.stacks).toHaveLength(6)
+
+  });
 })

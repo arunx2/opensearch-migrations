@@ -1,5 +1,6 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Generator, Optional
 from enum import Enum
+import json
 import logging
 import subprocess
 
@@ -8,9 +9,9 @@ from cerberus import Validator
 import requests
 import requests.auth
 from requests.auth import HTTPBasicAuth
-from requests_auth_aws_sigv4 import AWSSigV4
-
+from console_link.models.client_options import ClientOptions
 from console_link.models.schema_tools import contains_one_of
+from console_link.models.utils import SigV4AuthPlugin, create_boto3_client, append_user_agent_header_for_requests
 
 requests.packages.urllib3.disable_warnings()  # ignore: type
 
@@ -58,6 +59,7 @@ SCHEMA = {
         "schema": {
             "endpoint": {"type": "string", "required": True},
             "allow_insecure": {"type": "boolean", "required": False},
+            "version": {"type": "string", "required": False},
             "no_auth": NO_AUTH_SCHEMA,
             "basic_auth": BASIC_AUTH_SCHEMA,
             "sigv4": SIGV4_SCHEMA
@@ -73,12 +75,14 @@ class Cluster:
     """
 
     endpoint: str = ""
+    version: Optional[str] = None
     aws_secret_arn: Optional[str] = None
     auth_type: Optional[AuthMethod] = None
     auth_details: Optional[Dict[str, Any]] = None
     allow_insecure: bool = False
+    client_options: Optional[ClientOptions] = None
 
-    def __init__(self, config: Dict) -> None:
+    def __init__(self, config: Dict, client_options: Optional[ClientOptions] = None) -> None:
         logger.info(f"Initializing cluster with config: {config}")
         v = Validator(SCHEMA)
         if not v.validate({'cluster': config}):
@@ -95,6 +99,7 @@ class Cluster:
         elif 'sigv4' in config:
             self.auth_type = AuthMethod.SIGV4
             self.auth_details = config["sigv4"] if config["sigv4"] is not None else {}
+        self.client_options = client_options
 
     def get_basic_auth_password(self) -> str:
         """This method will return the basic auth password, if basic auth is enabled.
@@ -106,11 +111,11 @@ class Cluster:
             return self.auth_details["password"]
         # Pull password from AWS Secrets Manager
         assert "password_from_secret_arn" in self.auth_details  # for mypy's sake
-        client = boto3.client('secretsmanager')
+        client = create_boto3_client(aws_service_name="secretsmanager", client_options=self.client_options)
         password = client.get_secret_value(SecretId=self.auth_details["password_from_secret_arn"])
         return password["SecretString"]
 
-    def _get_sigv4_details(self, force_region=False) -> tuple[str, str]:
+    def _get_sigv4_details(self, force_region=False) -> tuple[str, Optional[str]]:
         """Return the service signing name and region name. If force_region is true,
         it will instantiate a boto3 session to guarantee that the region is not None.
         This will fail if AWS credentials are not available.
@@ -130,8 +135,8 @@ class Cluster:
                 password
             )
         elif self.auth_type == AuthMethod.SIGV4:
-            sigv4_details = self._get_sigv4_details()
-            return AWSSigV4(sigv4_details[0], region=sigv4_details[1])
+            service_name, region_name = self._get_sigv4_details(force_region=True)
+            return SigV4AuthPlugin(service_name, region_name)
         elif self.auth_type is AuthMethod.NO_AUTH:
             return None
         raise NotImplementedError(f"Auth type {self.auth_type} not implemented")
@@ -143,8 +148,13 @@ class Cluster:
         """
         if session is None:
             session = requests.Session()
-        
+
         auth = self._generate_auth_object()
+
+        request_headers = headers
+        if self.client_options and self.client_options.user_agent_extra:
+            user_agent_extra = self.client_options.user_agent_extra
+            request_headers = append_user_agent_header_for_requests(headers=headers, user_agent_extra=user_agent_extra)
 
         # Extract query parameters from kwargs
         params = kwargs.get('params', {})
@@ -157,7 +167,7 @@ class Cluster:
             params=params,
             auth=auth,
             data=data,
-            headers=headers,
+            headers=request_headers,
             timeout=timeout
         )
         logger.info(f"Received response: {r.status_code} {method.name} {self.endpoint}{path} - {r.text[:1000]}")
@@ -180,12 +190,79 @@ class Cluster:
             raise NotImplementedError(f"Auth type {self.auth_type} is not currently support for executing "
                                       f"benchmark workloads")
         # Note -- we should censor the password when logging this command
-        logger.info(f"Running opensearch-benchmark with '{workload}' workload")
-        command = (f"opensearch-benchmark execute-test --distribution-version=1.0.0 --target-host={self.endpoint} "
-                   f"--workload={workload} --pipeline=benchmark-only --test-mode --kill-running-processes "
-                   f"--workload-params={workload_params} --client-options={client_options}")
-        # While a little wordier, this apprach prevents us from censoring the password if it appears in other contexts,
+        # Fix commit used for OSB on latest verified working commit
+        workload_revision = "fc64258a9b2ed2451423d7758ca1c5880626c520"
+        logger.info(f"Running opensearch-benchmark with '{workload}' workload and revision '{workload_revision}'")
+        command = (f"opensearch-benchmark execute-test --distribution-version=1.0.0 "
+                   f"--exclude-tasks=check-cluster-health "
+                   f"--workload-revision={workload_revision} "
+                   f"--target-host={self.endpoint} "
+                   f"--workload={workload} "
+                   f"--pipeline=benchmark-only "
+                   "--test-mode --kill-running-processes "
+                   f"--workload-params={workload_params} "
+                   f"--client-options={client_options}")
+        # While a little wordier, this approach prevents us from censoring the password if it appears in other contexts,
         # e.g. username:admin,password:admin.
         display_command = command.replace(f"basic_auth_password:{password_to_censor}", "basic_auth_password:********")
         logger.info(f"Executing command: {display_command}")
         subprocess.run(command, shell=True)
+
+    def fetch_all_documents(self, index_name: str, batch_size: int = 100) -> Generator[Dict[str, Any], None, None]:
+        """
+        Generator that fetches all documents from the specified index in batches
+        """
+
+        session = requests.Session()
+
+        # Step 1: Initiate the scroll
+        path = f"/{index_name}/_search?scroll=1m"
+        headers = {'Content-Type': 'application/json'}
+        body = json.dumps({"size": batch_size, "query": {"match_all": {}}})
+        response = self.call_api(
+            path=path,
+            method=HttpMethod.POST,
+            data=body,
+            headers=headers,
+            session=session
+        )
+
+        response_json = response.json()
+        scroll_id = response_json.get('_scroll_id')
+        hits = response_json.get('hits', {}).get('hits', [])
+
+        # Yield the first batch of documents
+        if hits:
+            yield {hit['_id']: hit['_source'] for hit in hits}
+
+        # Step 2: Continue scrolling until no more documents
+        while scroll_id and hits:
+            path = "/_search/scroll"
+            body = json.dumps({"scroll": "1m", "scroll_id": scroll_id})
+            response = self.call_api(
+                path=path,
+                method=HttpMethod.POST,
+                data=body,
+                headers=headers,
+                session=session
+            )
+
+            response_json = response.json()
+            scroll_id = response_json.get('_scroll_id')
+            hits = response_json.get('hits', {}).get('hits', [])
+
+            if hits:
+                yield {hit['_id']: hit['_source'] for hit in hits}
+
+        # Step 3: Cleanup the scroll if necessary
+        if scroll_id:
+            path = "/_search/scroll"
+            body = json.dumps({"scroll_id": scroll_id})
+            self.call_api(
+                path=path,
+                method=HttpMethod.DELETE,
+                data=body,
+                headers=headers,
+                session=session,
+                raise_error=False
+            )

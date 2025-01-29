@@ -2,11 +2,10 @@ import logging
 import pytest
 import unittest
 from http import HTTPStatus
-from console_link.middleware.clusters import run_test_benchmarks, connection_check, clear_indices, ConnectionResult
+from console_link.middleware.clusters import run_test_benchmarks, connection_check, clear_cluster, ConnectionResult
 from console_link.models.cluster import Cluster
 from console_link.models.backfill_base import Backfill
 from console_link.models.command_result import CommandResult
-from console_link.models.snapshot import Snapshot
 from console_link.models.metadata import Metadata
 from console_link.cli import Context
 from common_operations import (get_document, create_document, create_index, check_doc_counts_match,
@@ -22,9 +21,9 @@ def preload_data(source_cluster: Cluster, target_cluster: Cluster):
     target_con_result: ConnectionResult = connection_check(target_cluster)
     assert target_con_result.connection_established is True
 
-    # Clear any existing non-system indices
-    clear_indices(source_cluster)
-    clear_indices(target_cluster)
+    # Clear all data from clusters
+    clear_cluster(source_cluster)
+    clear_cluster(target_cluster)
 
     # Preload data that test cases will verify is migrated
     # test_backfill_0001
@@ -52,17 +51,14 @@ def setup_backfill(request):
     assert metadata is not None
 
     backfill.create()
-    snapshot: Snapshot = pytest.console_env.snapshot
-    status_result: CommandResult = snapshot.status()
-    if status_result.success:
-        snapshot.delete()
-    snapshot_result: CommandResult = snapshot.create(wait=True)
+    snapshot_result: CommandResult = pytest.console_env.snapshot.create(wait=True)
     assert snapshot_result.success
     metadata_result: CommandResult = metadata.migrate()
     assert metadata_result.success
     backfill_start_result: CommandResult = backfill.start()
     assert backfill_start_result.success
-    backfill_scale_result: CommandResult = backfill.scale(units=10)
+    # small enough to allow containers to be reused, big enough to test scaling out
+    backfill_scale_result: CommandResult = backfill.scale(units=2)
     assert backfill_scale_result.success
 
 

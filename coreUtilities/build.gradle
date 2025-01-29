@@ -23,16 +23,7 @@ plugins {
     id 'java-test-fixtures'
 }
 
-java.sourceCompatibility = JavaVersion.VERSION_11
-java.targetCompatibility = JavaVersion.VERSION_11
-
-repositories {
-    mavenCentral()
-}
-
 dependencies {
-    api project(":commonDependencyVersionConstraints")
-
     implementation group: "com.google.protobuf", name: "protobuf-java"
     implementation group: 'org.slf4j', name: 'slf4j-api'
 
@@ -45,14 +36,17 @@ dependencies {
     implementation group: 'org.apache.logging.log4j', name: 'log4j-core'
     implementation group: 'org.apache.logging.log4j', name: 'log4j-slf4j2-impl'
 
+    // JCommander
+    compileOnly group: 'org.jcommander', name: 'jcommander'
+
     // OpenTelemetry core
     api group: 'io.opentelemetry', name: 'opentelemetry-api'
     api group: 'io.opentelemetry', name: 'opentelemetry-sdk'
     implementation group: 'io.opentelemetry', name: 'opentelemetry-exporter-otlp'
     implementation group: 'io.opentelemetry.semconv', name: 'opentelemetry-semconv'
 
-    implementation group: 'com.fasterxml.jackson.core', name: 'jackson-databind'
-    implementation group: 'com.fasterxml.jackson.core', name: 'jackson-core'
+    testImplementation group: 'com.fasterxml.jackson.core', name: 'jackson-databind'
+    testImplementation group: 'com.fasterxml.jackson.core', name: 'jackson-core'
 
     testImplementation group: 'org.mockito', name: 'mockito-core'
     testImplementation group: 'org.hamcrest', name: 'hamcrest'
@@ -63,8 +57,4 @@ dependencies {
     testFixturesImplementation group: 'io.opentelemetry', name: 'opentelemetry-api'
     testFixturesImplementation group: 'io.opentelemetry', name: 'opentelemetry-sdk-testing'
     testFixturesImplementation group: 'org.slf4j', name: 'slf4j-api'
-}
-
-tasks.named('test') {
-    useJUnitPlatform()
 }

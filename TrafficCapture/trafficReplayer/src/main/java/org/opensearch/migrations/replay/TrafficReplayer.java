@@ -1,11 +1,7 @@
 package org.opensearch.migrations.replay;
 
-import java.io.IOException;
 import java.lang.ref.WeakReference;
 import java.net.URI;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Paths;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -14,11 +10,11 @@ import java.util.Optional;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
+import org.opensearch.migrations.jcommander.NoSplitter;
 import org.opensearch.migrations.replay.tracing.RootReplayerContext;
 import org.opensearch.migrations.replay.traffic.source.TrafficStreamLimiter;
 import org.opensearch.migrations.replay.util.ActiveContextMonitor;
 import org.opensearch.migrations.replay.util.OrderedWorkerTracker;
-import org.opensearch.migrations.replay.util.TrackedFutureJsonFormatter;
 import org.opensearch.migrations.tracing.ActiveContextTracker;
 import org.opensearch.migrations.tracing.ActiveContextTrackerByActivityType;
 import org.opensearch.migrations.tracing.CompositeContextTracker;
@@ -27,11 +23,18 @@ import org.opensearch.migrations.transform.IAuthTransformerFactory;
 import org.opensearch.migrations.transform.RemovingAuthTransformerFactory;
 import org.opensearch.migrations.transform.SigV4AuthTransformerFactory;
 import org.opensearch.migrations.transform.StaticAuthTransformerFactory;
+import org.opensearch.migrations.transform.TransformationLoader;
+import org.opensearch.migrations.transform.TransformerConfigUtils;
+import org.opensearch.migrations.transform.TransformerParams;
+import org.opensearch.migrations.utils.ProcessHelpers;
+import org.opensearch.migrations.utils.TrackedFutureJsonFormatter;
 
 import com.beust.jcommander.JCommander;
 import com.beust.jcommander.Parameter;
 import com.beust.jcommander.ParameterException;
+import com.beust.jcommander.ParametersDelegate;
 import io.netty.util.concurrent.DefaultThreadFactory;
+import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.slf4j.LoggerFactory;
 import org.slf4j.event.Level;
@@ -50,7 +53,7 @@ public class TrafficReplayer {
     public static final String PACKET_TIMEOUT_SECONDS_PARAMETER_NAME = "--packet-timeout-seconds";
 
     public static final String LOOKAHEAD_TIME_WINDOW_PARAMETER_NAME = "--lookahead-time-window";
-    private static final long ACTIVE_WORK_MONITOR_CADENCE_MS = 30 * 1000;
+    private static final long ACTIVE_WORK_MONITOR_CADENCE_MS = 30 * 1000L;
 
     public static class DualException extends Exception {
         public final Throwable originalCause;
@@ -89,96 +92,229 @@ public class TrafficReplayer {
     }
 
     public static class Parameters {
-        @Parameter(required = true, arity = 1, description = "URI of the target cluster/domain")
+        @Parameter(
+            required = true,
+            arity = 1,
+            description = "URI of the target cluster/domain")
         String targetUriString;
-        @Parameter(required = false, names = {
-            "--insecure" }, arity = 0, description = "Do not check the server's certificate")
+        @Parameter(
+            required = false,
+            names = {"--insecure" },
+            arity = 0, description = "Do not check the server's certificate")
         boolean allowInsecureConnections;
 
-        @Parameter(required = false, names = {
-            REMOVE_AUTH_HEADER_VALUE_ARG }, arity = 0, description = "Remove the authorization header if present and do not replace it with anything.  "
+        @Parameter(
+            required = false,
+            names = {REMOVE_AUTH_HEADER_VALUE_ARG, "--removeAuthHeader" },
+            arity = 0, description = "Remove the authorization header if present and do not replace it with anything.  "
                 + "(cannot be used with other auth arguments)")
         boolean removeAuthHeader;
-        @Parameter(required = false, names = {
-            AUTH_HEADER_VALUE_ARG }, arity = 1, description = "Static value to use for the \"authorization\" header of each request "
+        @Parameter(
+            required = false,
+            names = { AUTH_HEADER_VALUE_ARG, "--authHeaderValue" },
+            arity = 1, description = "Static value to use for the \"authorization\" header of each request "
                 + "(cannot be used with other auth arguments)")
         String authHeaderValue;
-        @Parameter(required = false, names = {
-            AWS_AUTH_HEADER_USER_AND_SECRET_ARG }, arity = 2, description = "<USERNAME> <SECRET_ARN> pair to specify "
+        @Parameter(
+            required = false,
+            names = { AWS_AUTH_HEADER_USER_AND_SECRET_ARG, "--authHeaderUserAndSecret" },
+            splitter = NoSplitter.class,
+            arity = 2,
+            description = "<USERNAME> <SECRET_ARN> pair to specify "
                 + "\"authorization\" header value for each request.  "
                 + "The USERNAME specifies the plaintext user and the SECRET_ARN specifies the ARN or "
                 + "Secret name from AWS Secrets Manager to retrieve the password from for the password section"
                 + "(cannot be used with other auth arguments)")
         List<String> awsAuthHeaderUserAndSecret;
-        @Parameter(required = false, names = {
-            SIGV_4_AUTH_HEADER_SERVICE_REGION_ARG }, arity = 1, description = "Use AWS SigV4 to sign each request with the specified service name and region.  "
+        @Parameter(
+            required = false,
+            names = { SIGV_4_AUTH_HEADER_SERVICE_REGION_ARG, "--sigv4AuthHeaderServiceRegion" },
+            arity = 1,
+            description = "Use AWS SigV4 to sign each request with the specified service name and region.  "
                 + "(e.g. es,us-east-1)  "
                 + "DefaultCredentialsProvider is used to resolve credentials.  "
                 + "(cannot be used with other auth arguments)")
         String useSigV4ServiceAndRegion;
 
-        @Parameter(required = false, names = "--transformer-config", arity = 1, description = "Configuration of message transformers.  Either as a string that identifies the "
-            + "transformer that should be run (with default settings) or as json to specify options "
-            + "as well as multiple transformers to run in sequence.  "
-            + "For json, keys are the (simple) names of the loaded transformers and values are the "
-            + "configuration passed to each of the transformers.")
-        String transformerConfig;
-        @Parameter(required = false, names = "--transformer-config-file", arity = 1, description = "Path to the JSON configuration file of message transformers.")
-        String transformerConfigFile;
-        @Parameter(required = false, names = "--user-agent", arity = 1, description = "For HTTP requests to the target cluster, append this string (after \"; \") to"
+        @ParametersDelegate
+        private RequestTransformationParams requestTransformationParams = new RequestTransformationParams();
+
+        @ParametersDelegate
+        private TupleTransformationParams tupleTransformationParams = new TupleTransformationParams();
+
+        @Parameter(
+            required = false,
+            names = { "--user-agent", "--userAgent" },
+            arity = 1,
+            description = "For HTTP requests to the target cluster, append this string (after \"; \") to"
             + "the existing user-agent field or if the field wasn't present, simply use this value")
         String userAgent;
 
-        @Parameter(required = false, names = {
-            "-i",
-            "--input" }, arity = 1, description = "input file to read the request/response traces for the source cluster")
+        @Parameter(
+            required = false,
+            names = { "-i", "--input" },
+            arity = 1,
+            description = "input file to read the request/response traces for the source cluster")
         String inputFilename;
-        @Parameter(required = false, names = {
-            "-t",
-            PACKET_TIMEOUT_SECONDS_PARAMETER_NAME }, arity = 1, description = "assume that connections were terminated after this many "
+        @Parameter(
+            required = false,
+            names = {"-t", PACKET_TIMEOUT_SECONDS_PARAMETER_NAME, "--packetTimeoutSeconds" },
+            arity = 1,
+            description = "assume that connections were terminated after this many "
                 + "seconds of inactivity observed in the captured stream")
         int observedPacketConnectionTimeout = 70;
-        @Parameter(required = false, names = {
-            "--speedup-factor" }, arity = 1, description = "Accelerate the replayed communications by this factor.  "
+        @Parameter(
+            required = false,
+            names = { "--speedup-factor", "--speedupFactor" },
+            arity = 1, description = "Accelerate the replayed communications by this factor.  "
                 + "This means that between each interaction will be replayed at this rate faster "
                 + "than the original observations, provided that the replayer and target are able to keep up.")
         double speedupFactor = 1.0;
-        @Parameter(required = false, names = {
-            LOOKAHEAD_TIME_WINDOW_PARAMETER_NAME }, arity = 1, description = "Number of seconds of data that will be buffered.")
+        @Parameter(
+            required = false,
+            names = { LOOKAHEAD_TIME_WINDOW_PARAMETER_NAME,  "--lookaheadTimeWindow" },
+            arity = 1,
+            description = "Number of seconds of data that will be buffered.")
         int lookaheadTimeSeconds = 300;
-        @Parameter(required = false, names = {
-            "--max-concurrent-requests" }, arity = 1, description = "Maximum number of requests at a time that can be outstanding")
+        @Parameter(
+            required = false,
+            names = { "--max-concurrent-requests", "--maxConcurrentRequests" },
+            arity = 1,
+            description = "Maximum number of requests at a time that can be outstanding")
         int maxConcurrentRequests = 1024;
-        @Parameter(required = false, names = {
-            "--num-client-threads" }, arity = 1, description = "Number of threads to use to send requests from.")
+        @Parameter(
+            required = false,
+            names = { "--num-client-threads", "--numClientThreads" },
+            arity = 1,
+            description = "Number of threads to use to send requests from.")
         int numClientThreads = 0;
 
         // https://github.com/opensearch-project/opensearch-java/blob/main/java-client/src/main/java/org/opensearch/client/transport/httpclient5/ApacheHttpClient5TransportBuilder.java#L49-L54
-        @Parameter(required = false, names = {
-            "--target-response-timeout" }, arity = 1, description = "Seconds to wait before timing out a replayed request to the target.")
+        @Parameter(
+            required = false,
+            names = { "--target-response-timeout", "--targetResponseTimeout" },
+            arity = 1,
+            description = "Seconds to wait before timing out a replayed request to the target.")
         int targetServerResponseTimeoutSeconds = 30;
 
-        @Parameter(required = false, names = {
-            "--kafka-traffic-brokers" }, arity = 1, description = "Comma-separated list of host and port pairs that are the addresses of the Kafka brokers to bootstrap with i.e. 'kafka-1:9092,kafka-2:9092'")
+        @Parameter(
+            required = false,
+            names = { "--kafka-traffic-brokers", "--kafkaTrafficBrokers" },
+            arity = 1,
+            description = "Comma-separated list of host and port pairs that are the addresses of the Kafka brokers " +
+                "to bootstrap with i.e. 'kafka-1:9092,kafka-2:9092'")
         String kafkaTrafficBrokers;
-        @Parameter(required = false, names = {
-            "--kafka-traffic-topic" }, arity = 1, description = "Topic name used to pull messages from Kafka")
+        @Parameter(
+            required = false,
+            names = { "--kafka-traffic-topic", "--kafkaTrafficTopic" },
+            arity = 1,
+            description = "Topic name used to pull messages from Kafka")
         String kafkaTrafficTopic;
-        @Parameter(required = false, names = {
-            "--kafka-traffic-group-id" }, arity = 1, description = "Consumer group id that is used when pulling messages from Kafka")
+        @Parameter(
+            required = false,
+            names = { "--kafka-traffic-group-id", "--kafkaTrafficGroupId" },
+            arity = 1,
+            description = "Consumer group id that is used when pulling messages from Kafka")
         String kafkaTrafficGroupId;
-        @Parameter(required = false, names = {
-            "--kafka-traffic-enable-msk-auth" }, arity = 0, description = "Enables SASL properties required for connecting to MSK with IAM auth")
+        @Parameter(
+            required = false,
+            names = { "--kafka-traffic-enable-msk-auth", "--kafkaTrafficEnabledMskAuth" },
+            arity = 0,
+            description = "Enables SASL properties required for connecting to MSK with IAM auth")
         boolean kafkaTrafficEnableMSKAuth;
-        @Parameter(required = false, names = {
-            "--kafka-traffic-property-file" }, arity = 1, description = "File path for Kafka properties file to use for additional or overriden Kafka properties")
+        @Parameter(
+            required = false,
+            names = { "--kafka-traffic-property-file", "--kafkaTrafficPropertyFile" },
+            arity = 1,
+            description = "File path for Kafka properties file to use for additional or overriden Kafka properties")
         String kafkaTrafficPropertyFile;
 
-        @Parameter(required = false, names = {
-            "--otelCollectorEndpoint" }, arity = 1, description = "Endpoint (host:port) for the OpenTelemetry Collector to which metrics logs should be"
+        @Parameter(
+            required = false,
+            names = { "--otelCollectorEndpoint", "--otel-collector-endpoint" },
+            arity = 1,
+            description = "Endpoint (host:port) for the OpenTelemetry Collector to which metrics logs should be"
                 + "forwarded. If no value is provided, metrics will not be forwarded.")
         String otelCollectorEndpoint;
     }
+
+    @Getter
+    public static class RequestTransformationParams implements TransformerParams {
+        @Override
+        public String getTransformerConfigParameterArgPrefix() {
+            return REQUEST_SNAKE_TRANSFORMER_ARG_PREFIX;
+        }
+        private final static String REQUEST_SNAKE_TRANSFORMER_ARG_PREFIX = "";
+        private final static String REQUEST_CAMEL_TRANSFORMER_ARG_PREFIX = "";
+
+        @Parameter(
+            required = false,
+            names = { "--" + REQUEST_SNAKE_TRANSFORMER_ARG_PREFIX + "transformer-config-encoded",
+                "--" + REQUEST_CAMEL_TRANSFORMER_ARG_PREFIX + "transformerConfigEncoded" },
+            arity = 1,
+            description = "Configuration of message transformers.  The same contents as --transformer-config but " +
+                "Base64 encoded so that the configuration is easier to pass as a command line parameter.")
+        private String transformerConfigEncoded;
+
+        @Parameter(
+            required = false,
+            names = {"--" + REQUEST_SNAKE_TRANSFORMER_ARG_PREFIX + "transformer-config",
+                "--" + REQUEST_CAMEL_TRANSFORMER_ARG_PREFIX + "transformerConfig",},
+            arity = 1,
+            description = "Configuration of message transformers.  Either as a string that identifies the "
+                + "transformer that should be run (with default settings) or as json to specify options "
+                + "as well as multiple transformers to run in sequence.  "
+                + "For json, keys are the (simple) names of the loaded transformers and values are the "
+                + "configuration passed to each of the transformers.")
+        private String transformerConfig;
+
+        @Parameter(
+            required = false,
+            names = {"--" + REQUEST_SNAKE_TRANSFORMER_ARG_PREFIX + "transformer-config-file",
+                "--" + REQUEST_CAMEL_TRANSFORMER_ARG_PREFIX + "transformerConfigFile"},
+            arity = 1,
+            description = "Path to the JSON configuration file of message transformers.")
+        private String transformerConfigFile;
+    }
+
+    @Getter
+    public static class TupleTransformationParams implements TransformerParams {
+        public String getTransformerConfigParameterArgPrefix() {
+            return TUPLE_TRANSFORMER_CONFIG_SNAKE_PARAMETER_ARG_PREFIX;
+        }
+        final static String TUPLE_TRANSFORMER_CONFIG_SNAKE_PARAMETER_ARG_PREFIX = "tuple-";
+        final static String TUPLE_TRANSFORMER_CONFIG_CAMEL_PARAMETER_ARG_PREFIX = "tuple";
+
+        @Parameter(
+            required = false,
+            names = { "--" + TUPLE_TRANSFORMER_CONFIG_SNAKE_PARAMETER_ARG_PREFIX + "transformer-config-base64",
+                "--" + TUPLE_TRANSFORMER_CONFIG_CAMEL_PARAMETER_ARG_PREFIX + "TransformerConfigBase64" },
+            arity = 1,
+            description = "Configuration of tuple transformers.  The same contents as --tuple-transformer-config but " +
+                "Base64 encoded so that the configuration is easier to pass as a command line parameter.")
+        private String transformerConfigEncoded;
+
+        @Parameter(
+            required = false,
+            names = { "--" + TUPLE_TRANSFORMER_CONFIG_SNAKE_PARAMETER_ARG_PREFIX + "transformer-config",
+                "--" + TUPLE_TRANSFORMER_CONFIG_CAMEL_PARAMETER_ARG_PREFIX + "TransformerConfig" },
+            arity = 1,
+            description = "Configuration of tuple transformers.  Either as a string that identifies the "
+                + "transformer that should be run (with default settings) or as json to specify options "
+                + "as well as multiple transformers to run in sequence.  "
+                + "For json, keys are the (simple) names of the loaded transformers and values are the "
+                + "configuration passed to each of the transformers.")
+        private String transformerConfig;
+
+        @Parameter(
+            required = false,
+            names = { "--" + TUPLE_TRANSFORMER_CONFIG_SNAKE_PARAMETER_ARG_PREFIX + "transformer-config-file",
+                "--" + TUPLE_TRANSFORMER_CONFIG_CAMEL_PARAMETER_ARG_PREFIX + "TransformerConfigFile" } ,
+            arity = 1,
+            description = "Path to the JSON configuration file of tuple transformers.")
+        private String transformerConfigFile;
+    }
+
 
     private static Parameters parseArgs(String[] args) {
         Parameters p = new Parameters();
@@ -195,44 +331,21 @@ public class TrafficReplayer {
         }
     }
 
-    private static String getTransformerConfig(Parameters params) {
-        if (params.transformerConfigFile != null
-            && !params.transformerConfigFile.isBlank()
-            && params.transformerConfig != null
-            && !params.transformerConfig.isBlank()) {
-            System.err.println("Specify either --transformer-config or --transformer-config-file, not both.");
-            System.exit(4);
-        }
-
-        if (params.transformerConfigFile != null && !params.transformerConfigFile.isBlank()) {
-            try {
-                return Files.readString(Paths.get(params.transformerConfigFile), StandardCharsets.UTF_8);
-            } catch (IOException e) {
-                System.err.println("Error reading transformer configuration file: " + e.getMessage());
-                System.exit(5);
-            }
-        }
-
-        if (params.transformerConfig != null && !params.transformerConfig.isBlank()) {
-            return params.transformerConfig;
-        }
-
-        return null;
-    }
-
     public static void main(String[] args) throws Exception {
+        System.err.println("Got args: " + String.join("; ", args));
+        final var workerId = ProcessHelpers.getNodeInstanceName();
+        log.info("Starting Traffic Replayer with id=" + workerId);
+
         var activeContextLogger = LoggerFactory.getLogger(ALL_ACTIVE_CONTEXTS_MONITOR_LOGGER);
         var params = parseArgs(args);
         URI uri;
-        System.err.println("Starting Traffic Replayer");
-        System.err.println("Got args: " + String.join("; ", args));
         try {
             uri = new URI(params.targetUriString);
         } catch (Exception e) {
             final var msg = "Exception parsing " + params.targetUriString;
             System.err.println(msg);
             System.err.println(e.getMessage());
-            log.atError().setMessage(msg).setCause(e).log();
+            log.atError().setCause(e).setMessage("{}").addArgument(msg).log();
             System.exit(3);
             return;
         }
@@ -258,7 +371,9 @@ public class TrafficReplayer {
         );
         var contextTrackers = new CompositeContextTracker(globalContextTracker, perContextTracker);
         var topContext = new RootReplayerContext(
-            RootOtelContext.initializeOpenTelemetryWithCollectorOrAsNoop(params.otelCollectorEndpoint, "replay"),
+            RootOtelContext.initializeOpenTelemetryWithCollectorOrAsNoop(params.otelCollectorEndpoint,
+                "replay",
+                ProcessHelpers.getNodeInstanceName()),
             contextTrackers
         );
 
@@ -269,28 +384,38 @@ public class TrafficReplayer {
                 params,
                 Duration.ofSeconds(params.lookaheadTimeSeconds)
             );
-            var authTransformer = buildAuthTransformerFactory(params)
+            var authTransformer = buildAuthTransformerFactory(params);
+            var trafficStreamLimiter = new TrafficStreamLimiter(params.maxConcurrentRequests)
         ) {
-            String transformerConfig = getTransformerConfig(params);
-            if (transformerConfig != null) {
-                log.atInfo().setMessage(() -> "Transformations config string: " + transformerConfig).log();
+            var timeShifter = new TimeShifter(params.speedupFactor);
+            var serverTimeout = Duration.ofSeconds(params.targetServerResponseTimeoutSeconds);
+
+            String requestTransformerConfig = TransformerConfigUtils.getTransformerConfig(params.requestTransformationParams);
+            if (requestTransformerConfig != null) {
+                log.atInfo().setMessage("Request Transformations config string: {}")
+                    .addArgument(requestTransformerConfig).log();
             }
-            var orderedRequestTracker = new OrderedWorkerTracker<Void>();
+
+            String tupleTransformerConfig = TransformerConfigUtils.getTransformerConfig(params.tupleTransformationParams);
+            if (requestTransformerConfig != null) {
+                log.atInfo().setMessage("Tuple Transformations config string: {}")
+                    .addArgument(tupleTransformerConfig).log();
+            }
+
+            final var orderedRequestTracker = new OrderedWorkerTracker<Void>();
+            final var hostname = uri.getHost();
+
             var tr = new TrafficReplayerTopLevel(
                 topContext,
                 uri,
                 authTransformer,
-                new TransformationLoader().getTransformerFactoryLoader(
-                    uri.getHost(),
-                    params.userAgent,
-                    transformerConfig
-                ),
-                TrafficReplayerTopLevel.makeClientConnectionPool(
+                () -> new TransformationLoader().getTransformerFactoryLoader(hostname, params.userAgent, requestTransformerConfig),
+                TrafficReplayerTopLevel.makeNettyPacketConsumerConnectionPool(
                     uri,
                     params.allowInsecureConnections,
                     params.numClientThreads
                 ),
-                new TrafficStreamLimiter(params.maxConcurrentRequests),
+                trafficStreamLimiter,
                 orderedRequestTracker
             );
             activeContextMonitor = new ActiveContextMonitor(
@@ -303,20 +428,19 @@ public class TrafficReplayer {
             );
             ActiveContextMonitor finalActiveContextMonitor = activeContextMonitor;
             scheduledExecutorService.scheduleAtFixedRate(() -> {
-                activeContextLogger.atInfo()
-                    .setMessage(
-                        () -> "Total requests outstanding at " + Instant.now() + ": " + tr.requestWorkTracker.size()
-                    )
+                activeContextLogger.atInfo().setMessage("Total requests outstanding at {}: {}")
+                    .addArgument(Instant::now)
+                    .addArgument(tr.requestWorkTracker::size)
                     .log();
                 finalActiveContextMonitor.run();
             }, ACTIVE_WORK_MONITOR_CADENCE_MS, ACTIVE_WORK_MONITOR_CADENCE_MS, TimeUnit.MILLISECONDS);
 
             setupShutdownHookForReplayer(tr);
-            var tupleWriter = new TupleParserChainConsumer(new ResultsToLogsConsumer());
-            var timeShifter = new TimeShifter(params.speedupFactor);
+            var tupleWriter = new TupleParserChainConsumer(new ResultsToLogsConsumer(null, null,
+                new TransformationLoader().getTransformerFactoryLoader(tupleTransformerConfig)));
             tr.setupRunAndWaitForReplayWithShutdownChecks(
                 Duration.ofSeconds(params.observedPacketConnectionTimeout),
-                Duration.ofSeconds(params.targetServerResponseTimeoutSeconds),
+                serverTimeout,
                 blockingTrafficSource,
                 timeShifter,
                 tupleWriter
@@ -328,9 +452,9 @@ public class TrafficReplayer {
                 var acmLevel = globalContextTracker.getActiveScopesByAge().findAny().isPresent()
                     ? Level.ERROR
                     : Level.INFO;
-                activeContextLogger.atLevel(acmLevel).setMessage(() -> "Outstanding work after shutdown...").log();
+                activeContextLogger.atLevel(acmLevel).setMessage("Outstanding work after shutdown...").log();
                 activeContextMonitor.run();
-                activeContextLogger.atLevel(acmLevel).setMessage(() -> "[end of run]]").log();
+                activeContextLogger.atLevel(acmLevel).setMessage("[end of run]]").log();
             }
         }
     }
@@ -341,20 +465,20 @@ public class TrafficReplayer {
             // both Log4J and the java builtin loggers add shutdown hooks.
             // The API for addShutdownHook says that those hooks registered will run in an undetermined order.
             // Hence, the reason that this code logs via slf4j logging AND stderr.
-            {
-                var beforeMsg = "Running TrafficReplayer Shutdown.  "
+            Optional.of("Running TrafficReplayer Shutdown.  "
                     + "The logging facilities may also be shutting down concurrently, "
-                    + "resulting in missing logs messages.";
-                log.atWarn().setMessage(beforeMsg).log();
-                System.err.println(beforeMsg);
-            }
+                    + "resulting in missing logs messages.")
+                .ifPresent(beforeMsg -> {
+                    log.atWarn().setMessage(beforeMsg).log();
+                    System.err.println(beforeMsg);
+                });
             Optional.ofNullable(weakTrafficReplayer.get()).ifPresent(o -> o.shutdown(null));
-            {
-                var afterMsg = "Done shutting down TrafficReplayer (due to Runtime shutdown).  "
-                    + "Logs may be missing for events that have happened after the Shutdown event was received.";
-                log.atWarn().setMessage(afterMsg).log();
-                System.err.println(afterMsg);
-            }
+            Optional.of("Done shutting down TrafficReplayer (due to Runtime shutdown).  "
+                    + "Logs may be missing for events that have happened after the Shutdown event was received.")
+                .ifPresent(afterMsg -> {
+                    log.atWarn().setMessage(afterMsg).log();
+                    System.err.println(afterMsg);
+                });
         }));
     }
 

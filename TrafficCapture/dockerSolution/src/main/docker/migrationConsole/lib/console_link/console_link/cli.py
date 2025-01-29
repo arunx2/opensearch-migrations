@@ -1,5 +1,8 @@
 import json
 from pprint import pprint
+import sys
+import time
+from typing import Dict
 import click
 import console_link.middleware.clusters as clusters_
 import console_link.middleware.metrics as metrics_
@@ -7,7 +10,11 @@ import console_link.middleware.backfill as backfill_
 import console_link.middleware.snapshot as snapshot_
 import console_link.middleware.metadata as metadata_
 import console_link.middleware.replay as replay_
+import console_link.middleware.kafka as kafka_
+import console_link.middleware.tuples as tuples_
 
+from console_link.models.cluster import HttpMethod
+from console_link.models.backfill_rfs import RfsWorkersInProgress, WorkingIndexDoesntExist
 from console_link.models.utils import ExitCode
 from console_link.environment import Environment
 from console_link.models.metrics_source import Component, MetricStatistic
@@ -31,9 +38,7 @@ class Context(object):
 
 
 @click.group()
-@click.option(
-    "--config-file", default="/etc/migration_services.yaml", help="Path to config file"
-)
+@click.option("--config-file", default="/etc/migration_services.yaml", help="Path to config file")
 @click.option("--json", is_flag=True)
 @click.option('-v', '--verbose', count=True, help="Verbosity level. Default is warn, -v is info, -vv is debug.")
 @click.pass_context
@@ -73,6 +78,9 @@ def cat_indices_cmd(ctx, refresh):
             )
         )
         return
+    
+    if not refresh:
+        click.echo("\nWARNING: Cluster information may be stale. Use --refresh to update.\n")
     click.echo("SOURCE CLUSTER")
     if ctx.env.source_cluster:
         click.echo(clusters_.cat_indices(ctx.env.source_cluster, refresh=refresh))
@@ -135,6 +143,61 @@ def clear_indices_cmd(ctx, acknowledge_risk, cluster):
             click.echo("Aborting command.")
 
 
+def parse_headers(header: str) -> Dict:
+    headers = {}
+    for h in header:
+        try:
+            key, value = h.split(":", 1)
+            headers[key.strip()] = value.strip()
+        except ValueError:
+            raise click.BadParameter(f"Invalid header format: {h}. Expected format: 'Header: Value'.")
+    return headers
+
+
+@cluster_group.command(name="curl")
+@click.option('-X', '--request', default='GET', help="HTTP method to use",
+              type=click.Choice([m.name for m in HttpMethod]))
+@click.option('-H', '--header', multiple=True, help='Pass custom header(s) to the server.')
+@click.option('-d', '--data', help='Send specified data in a POST request.')
+@click.option('--json', 'json_data', help='Send data as JSON.')
+@click.argument('cluster', required=True, type=click.Choice(['target_cluster', 'source_cluster'], case_sensitive=False))
+@click.argument('path', required=True)
+@click.pass_obj
+def cluster_curl_cmd(ctx, cluster, path, request, header, data, json_data):
+    """This implements a small subset of curl commands, formatted for use against configured source or target clusters.
+    By default the cluster definition is configured to use the `/etc/migration-services.yaml` file that is pre-prepared
+    on the migration console, but `--config-file` can point to any YAML file that defines a `source_cluster` or
+    target_cluster` based on the schema of the `services.yaml` file.
+    
+    In specifying the path of the route, use the name of the YAML object as the domain, followed by a space and the
+    path, e.g. `source_cluster /_cat/indices`."""
+
+    headers = parse_headers(header)
+    
+    if json_data:
+        try:
+            data = json.dumps(json.loads(json_data))
+            headers['Content-Type'] = 'application/json'
+        except json.JSONDecodeError:
+            raise click.BadParameter("Invalid JSON format.")
+
+    try:
+        cluster = ctx.env.__getattribute__(cluster)
+        if cluster is None:
+            raise AttributeError
+    except AttributeError:
+        raise click.BadArgumentUsage(f"Unknown cluster {cluster}. Currently only `source_cluster` and `target_cluster`"
+                                     " are valid and must also be defined in the config file.")
+
+    if path[0] != '/':
+        path = '/' + path
+
+    response = clusters_.call_api(cluster, path, method=HttpMethod[request], headers=headers, data=data)
+    if not response.ok:
+        click.echo(f"Error: {response.status_code}")
+    click.echo(response.text)
+
+
 # ##################### SNAPSHOT ###################
 
 
@@ -147,16 +210,18 @@ def snapshot_group(ctx):
         raise click.UsageError("Snapshot is not set")
 
 
-@snapshot_group.command(name="create")
+@snapshot_group.command(name="create", context_settings=dict(ignore_unknown_options=True))
 @click.option('--wait', is_flag=True, default=False, help='Wait for snapshot completion')
 @click.option('--max-snapshot-rate-mb-per-node', type=int, default=None,
               help='Maximum snapshot rate in MB/s per node')
+@click.argument('extra_args', nargs=-1, type=click.UNPROCESSED)
 @click.pass_obj
-def create_snapshot_cmd(ctx, wait, max_snapshot_rate_mb_per_node):
+def create_snapshot_cmd(ctx, wait, max_snapshot_rate_mb_per_node, extra_args):
     """Create a snapshot of the source cluster"""
     snapshot = ctx.env.snapshot
     result = snapshot_.create(snapshot, wait=wait,
-                              max_snapshot_rate_mb_per_node=max_snapshot_rate_mb_per_node)
+                              max_snapshot_rate_mb_per_node=max_snapshot_rate_mb_per_node,
+                              extra_args=extra_args)
     click.echo(result.value)
 
 
@@ -166,6 +231,23 @@ def create_snapshot_cmd(ctx, wait, max_snapshot_rate_mb_per_node):
 def status_snapshot_cmd(ctx, deep_check):
     """Check the status of the snapshot"""
     result = snapshot_.status(ctx.env.snapshot, deep_check=deep_check)
+    click.echo(result.value)
+
+
+@snapshot_group.command(name="delete")
+@click.option("--acknowledge-risk", is_flag=True, show_default=True, default=False,
+              help="Flag to acknowledge risk and skip confirmation")
+@click.pass_obj
+def delete_snapshot_cmd(ctx, acknowledge_risk: bool):
+    """Delete the snapshot"""
+    if not acknowledge_risk:
+        confirmed = click.confirm('If you proceed with deleting the snapshot, the cluster will delete underlying local '
+                                  'and remote files associated with the snapshot. Are you sure you want to continue?')
+        if not confirmed:
+            click.echo("Aborting the command to delete snapshot.")
+            return
+    logger.info("Deleting snapshot")
+    result = snapshot_.delete(ctx.env.snapshot)
     click.echo(result.value)
 
 # ##################### BACKFILL ###################
@@ -212,6 +294,16 @@ def start_backfill_cmd(ctx, pipeline_name):
     click.echo(message)
 
 
+@backfill_group.command(name="pause")
+@click.option('--pipeline-name', default=None, help='Optionally specify a pipeline name')
+@click.pass_obj
+def pause_backfill_cmd(ctx, pipeline_name):
+    exitcode, message = backfill_.pause(ctx.env.backfill, pipeline_name=pipeline_name)
+    if exitcode != ExitCode.SUCCESS:
+        raise click.ClickException(message)
+    click.echo(message)
+
+
 @backfill_group.command(name="stop")
 @click.option('--pipeline-name', default=None, help='Optionally specify a pipeline name')
 @click.pass_obj
@@ -220,6 +312,22 @@ def stop_backfill_cmd(ctx, pipeline_name):
     if exitcode != ExitCode.SUCCESS:
         raise click.ClickException(message)
     click.echo(message)
+
+    click.echo("Archiving the working state of the backfill operation...")
+    exitcode, message = backfill_.archive(ctx.env.backfill)
+
+    if isinstance(message, WorkingIndexDoesntExist):
+        click.echo("Working state index doesn't exist, skipping archive operation.")
+        return
+
+    while isinstance(message, RfsWorkersInProgress):
+        click.echo("RFS Workers are still running, waiting for them to complete...")
+        time.sleep(5)
+        exitcode, message = backfill_.archive(ctx.env.backfill)
+
+    if exitcode != ExitCode.SUCCESS:
+        raise click.ClickException(message)
+    click.echo(f"Backfill working state archived to: {message}")
 
 
 @backfill_group.command(name="scale")
@@ -307,11 +415,27 @@ def metadata_group(ctx):
         raise click.UsageError("Metadata is not set")
 
 
-@metadata_group.command(name="migrate")
-@click.option("--detach", is_flag=True, help="Run metadata migration in detached mode")
+@metadata_group.command(name="migrate", context_settings=dict(
+    ignore_unknown_options=True,
+    help_option_names=[]
+))
+@click.argument('extra_args', nargs=-1, type=click.UNPROCESSED)
 @click.pass_obj
-def migrate_metadata_cmd(ctx, detach):
-    exitcode, message = metadata_.migrate(ctx.env.metadata, detach)
+def migrate_metadata_cmd(ctx, extra_args):
+    exitcode, message = metadata_.migrate(ctx.env.metadata, extra_args)
+    if exitcode != ExitCode.SUCCESS:
+        raise click.ClickException(message)
+    click.echo(message)
+
+
+@metadata_group.command(name="evaluate", context_settings=dict(
+    ignore_unknown_options=True,
+    help_option_names=[]
+))
+@click.argument('extra_args', nargs=-1, type=click.UNPROCESSED)
+@click.pass_obj
+def evaluate_metadata_cmd(ctx, extra_args):
+    exitcode, message = metadata_.evaluate(ctx.env.metadata, extra_args)
     if exitcode != ExitCode.SUCCESS:
         raise click.ClickException(message)
     click.echo(message)
@@ -381,7 +505,7 @@ def kafka_group(ctx):
 @click.option('--topic-name', default="logging-traffic-topic", help='Specify a topic name to create')
 @click.pass_obj
 def create_topic_cmd(ctx, topic_name):
-    result = ctx.env.kafka.create_topic(topic_name=topic_name)
+    result = kafka_.create_topic(ctx.env.kafka, topic_name=topic_name)
     click.echo(result.value)
 
 
@@ -392,13 +516,13 @@ def create_topic_cmd(ctx, topic_name):
 @click.pass_obj
 def delete_topic_cmd(ctx, acknowledge_risk, topic_name):
     if acknowledge_risk:
-        result = ctx.env.kafka.delete_topic(topic_name=topic_name)
+        result = kafka_.delete_topic(ctx.env.kafka, topic_name=topic_name)
         click.echo(result.value)
     else:
         if click.confirm('Deleting a topic will irreversibly delete all captured traffic records stored in that '
                          'topic. Are you sure you want to continue?'):
             click.echo(f"Performing delete topic operation on {topic_name} topic...")
-            result = ctx.env.kafka.delete_topic(topic_name=topic_name)
+            result = kafka_.delete_topic(ctx.env.kafka, topic_name=topic_name)
             click.echo(result.value)
         else:
             click.echo("Aborting command.")
@@ -408,7 +532,7 @@ def delete_topic_cmd(ctx, acknowledge_risk, topic_name):
 @click.option('--group-name', default="logging-group-default", help='Specify a group name to describe')
 @click.pass_obj
 def describe_group_command(ctx, group_name):
-    result = ctx.env.kafka.describe_consumer_group(group_name=group_name)
+    result = kafka_.describe_consumer_group(ctx.env.kafka, group_name=group_name)
     click.echo(result.value)
 
 
@@ -416,7 +540,7 @@ def describe_group_command(ctx, group_name):
 @click.option('--topic-name', default="logging-traffic-topic", help='Specify a topic name to describe')
 @click.pass_obj
 def describe_topic_records_cmd(ctx, topic_name):
-    result = ctx.env.kafka.describe_topic_records(topic_name=topic_name)
+    result = kafka_.describe_topic_records(ctx.env.kafka, topic_name=topic_name)
     click.echo(result.value)
 
 # ##################### UTILITIES ###################
@@ -466,6 +590,26 @@ def completion(ctx, config_file, json, shell):
     except RuntimeError as exc:
         click.echo(f"Error: {exc}", err=True)
         ctx.exit(1)
+
+
+@cli.group(name="tuples")
+@click.pass_obj
+def tuples_group(ctx):
+    """ All commands related to tuples. """
+    pass
+
+
+@tuples_group.command()
+@click.option('--in', 'inputfile',
+              type=click.File('r'),
+              default=sys.stdin)
+@click.option('--out', 'outputfile',
+              type=click.File('a'),
+              default=sys.stdout)
+def show(inputfile, outputfile):
+    tuples_.convert(inputfile, outputfile)
+    if outputfile != sys.stdout:
+        click.echo(f"Converted tuples output to {outputfile.name}")
 
 
 #################################################

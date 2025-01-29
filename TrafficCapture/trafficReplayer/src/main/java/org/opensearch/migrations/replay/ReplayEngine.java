@@ -5,14 +5,13 @@ import java.time.Instant;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
-import java.util.stream.Stream;
 
+import org.opensearch.migrations.replay.datatypes.ByteBufList;
 import org.opensearch.migrations.replay.datatypes.IndexedChannelInteraction;
 import org.opensearch.migrations.replay.tracing.IReplayContexts;
 import org.opensearch.migrations.replay.traffic.source.BufferedFlowController;
-import org.opensearch.migrations.replay.util.TrackedFuture;
+import org.opensearch.migrations.utils.TrackedFuture;
 
-import io.netty.buffer.ByteBuf;
 import io.netty.util.concurrent.ScheduledFuture;
 import lombok.extern.slf4j.Slf4j;
 
@@ -61,13 +60,12 @@ public class ReplayEngine {
         // this is gross, but really useful. Grab a thread out of the clientConnectionPool's event loop
         // and run a daemon to update the contentTimeController if there isn't any work that will be doing that
         var bufferPeriodMs = getUpdatePeriodMs();
-        updateContentTimeControllerScheduledFuture = networkSendOrchestrator.clientConnectionPool.eventLoopGroup.next()
-            .scheduleAtFixedRate(
-                this::updateContentTimeControllerWhenIdling,
-                bufferPeriodMs,
-                bufferPeriodMs,
-                TIME_UNIT_MILLIS
-            );
+        updateContentTimeControllerScheduledFuture = networkSendOrchestrator.scheduleAtFixedRate(
+            this::updateContentTimeControllerWhenIdling,
+            bufferPeriodMs,
+            bufferPeriodMs,
+            TIME_UNIT_MILLIS
+        );
     }
 
     private long getUpdatePeriodMs() {
@@ -90,7 +88,7 @@ public class ReplayEngine {
             return;
         }
         var currentSourceTimeOp = timeShifter.transformRealTimeToSourceTime(Instant.now());
-        if (!currentSourceTimeOp.isPresent()) {
+        if (currentSourceTimeOp.isEmpty()) {
             // do nothing - the traffic source shouldn't be blocking initially.
             // Leave it manage its own initialization since we don't have any better information about what a
             // start time might be yet.
@@ -123,45 +121,30 @@ public class ReplayEngine {
             f -> f.whenComplete((v, t) -> Utils.setIfLater(lastCompletedSourceTimeEpochMs, timestamp.toEpochMilli()))
                 .whenComplete((v, t) -> {
                     var newCount = totalCountOfScheduledTasksOutstanding.decrementAndGet();
-                    log.atInfo()
-                        .setMessage(
-                            () -> "Scheduled task '"
-                                + taskDescription
-                                + "' finished ("
-                                + stringableKey
-                                + ") decremented tasksOutstanding to "
-                                + newCount
-                        )
+                    log.atInfo().setMessage("Scheduled task '{}' finished ({}) decremented tasksOutstanding to {}")
+                        .addArgument(taskDescription)
+                        .addArgument(stringableKey)
+                        .addArgument(newCount)
                         .log();
                 })
                 .whenComplete((v, t) -> contentTimeController.stopReadsPast(timestamp))
-                .whenComplete(
-                    (v, t) -> log.atDebug()
-                        .setMessage(
-                            () -> "work finished and used timestamp="
-                                + timestamp
-                                + " to update contentTimeController (tasksOutstanding="
-                                + totalCountOfScheduledTasksOutstanding.get()
-                                + ")"
-                        )
-                        .log()
+                .whenComplete((v, t) -> log.atDebug()
+                    .setMessage("work finished and used timestamp={} " +
+                        "to update contentTimeController (tasksOutstanding={})")
+                    .addArgument(timestamp)
+                    .addArgument(totalCountOfScheduledTasksOutstanding::get)
+                    .log()
                 ),
             () -> "Updating fields for callers to poll progress and updating backpressure"
         );
     }
 
     private static void logStartOfWork(Object stringableKey, long newCount, Instant start, String label) {
-        log.atInfo()
-            .setMessage(
-                () -> "Scheduling '"
-                    + label
-                    + "' ("
-                    + stringableKey
-                    + ") to run at "
-                    + start
-                    + " incremented tasksOutstanding to "
-                    + newCount
-            )
+        log.atInfo().setMessage("Scheduling '{}' ({}) to run at {} incremented tasksOutstanding to {}")
+            .addArgument(label)
+            .addArgument(stringableKey)
+            .addArgument(start)
+            .addArgument(newCount)
             .log();
     }
 
@@ -182,12 +165,13 @@ public class ReplayEngine {
         return hookWorkFinishingUpdates(result, originalStart, requestCtx, label);
     }
 
-    public TrackedFuture<String, AggregatedRawResponse> scheduleRequest(
+    public <T> TrackedFuture<String, T> scheduleRequest(
         IReplayContexts.IReplayerHttpTransactionContext ctx,
         Instant originalStart,
         Instant originalEnd,
         int numPackets,
-        Stream<ByteBuf> packets
+        ByteBufList packets,
+        RequestSenderOrchestrator.RetryVisitor<T> retryVisitor
     ) {
         var newCount = totalCountOfScheduledTasksOutstanding.incrementAndGet();
         final String label = "request";
@@ -197,23 +181,15 @@ public class ReplayEngine {
         var requestKey = ctx.getReplayerRequestKey();
         logStartOfWork(requestKey, newCount, start, label);
 
-        log.atDebug()
-            .setMessage(
-                () -> "Scheduling request for "
-                    + ctx
-                    + " to run from ["
-                    + start
-                    + ", "
-                    + end
-                    + " with an interval of "
-                    + interval
-                    + " for "
-                    + numPackets
-                    + " packets"
-            )
+        log.atDebug().setMessage("Scheduling request for {} to run from [{}, {}] with an interval of {} for {} packets")
+            .addArgument(ctx)
+            .addArgument(start)
+            .addArgument(end)
+            .addArgument(interval)
+            .addArgument(numPackets)
             .log();
-        var sendResult = networkSendOrchestrator.scheduleRequest(requestKey, ctx, start, interval, packets);
-        return hookWorkFinishingUpdates(sendResult, originalStart, requestKey, label);
+        var result = networkSendOrchestrator.scheduleRequest(requestKey, ctx, start, interval, packets, retryVisitor);
+        return hookWorkFinishingUpdates(result, originalStart, requestKey, label);
     }
 
     public TrackedFuture<String, Void> closeConnection(

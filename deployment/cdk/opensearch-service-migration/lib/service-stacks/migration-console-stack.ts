@@ -1,38 +1,39 @@
 import {StackPropsExt} from "../stack-composer";
 import {IVpc, SecurityGroup} from "aws-cdk-lib/aws-ec2";
-import {CpuArchitecture, MountPoint, PortMapping, Protocol, Volume} from "aws-cdk-lib/aws-ecs";
+import {CpuArchitecture, PortMapping, Protocol} from "aws-cdk-lib/aws-ecs";
 import {Construct} from "constructs";
-import {join} from "path";
 import {Effect, PolicyStatement, Role, ServicePrincipal} from "aws-cdk-lib/aws-iam";
 import {
     createMigrationStringParameter,
     createOpenSearchIAMAccessPolicy,
     createOpenSearchServerlessIAMAccessPolicy,
-    getTargetPasswordAccessPolicy,
+    getSecretAccessPolicy,
     getMigrationStringParameterValue,
     hashStringSHA256,
-    MigrationSSMParameter
+    MigrationSSMParameter,
+    createSnapshotOnAOSRole
 } from "../common-utilities";
 import {StreamingSourceType} from "../streaming-source-type";
 import {LogGroup, RetentionDays} from "aws-cdk-lib/aws-logs";
 import {Fn, RemovalPolicy} from "aws-cdk-lib";
-import {MetadataMigrationYaml, ServicesYaml} from "../migration-services-yaml";
+import {ClusterYaml, MetadataMigrationYaml, ServicesYaml} from "../migration-services-yaml";
 import {ELBTargetGroup, MigrationServiceCore} from "./migration-service-core";
 import { OtelCollectorSidecar } from "./migration-otel-collector-sidecar";
+import { SharedLogFileSystem } from "../components/shared-log-file-system";
 
 export interface MigrationConsoleProps extends StackPropsExt {
     readonly migrationsSolutionVersion: string,
     readonly vpc: IVpc,
     readonly streamingSourceType: StreamingSourceType,
-    readonly fetchMigrationEnabled: boolean,
     readonly fargateCpuArch: CpuArchitecture,
     readonly migrationConsoleEnableOSI: boolean,
     readonly migrationAPIEnabled?: boolean,
     readonly migrationAPIAllowedHosts?: string,
-    readonly targetGroups: ELBTargetGroup[],
+    readonly targetGroups?: ELBTargetGroup[],
     readonly servicesYaml: ServicesYaml,
     readonly otelCollectorEnabled?: boolean,
-    readonly sourceClusterDisabled?: boolean,
+    readonly sourceCluster?: ClusterYaml,
+    readonly managedServiceSourceSnapshotEnabled?: boolean
 }
 
 export class MigrationConsoleStack extends MigrationServiceCore {
@@ -131,11 +132,11 @@ export class MigrationConsoleStack extends MigrationServiceCore {
     constructor(scope: Construct, id: string, props: MigrationConsoleProps) {
         super(scope, id, props)
 
-        let securityGroups = [
+        const securityGroups = [
             { id: "serviceSG", param: MigrationSSMParameter.SERVICE_SECURITY_GROUP_ID },
             { id: "trafficStreamSourceAccessSG", param: MigrationSSMParameter.TRAFFIC_STREAM_SOURCE_ACCESS_SECURITY_GROUP_ID },
             { id: "defaultDomainAccessSG", param: MigrationSSMParameter.OS_ACCESS_SECURITY_GROUP_ID },
-            { id: "replayerOutputAccessSG", param: MigrationSSMParameter.REPLAYER_OUTPUT_ACCESS_SECURITY_GROUP_ID }
+            { id: "sharedLogsAccessSG", param: MigrationSSMParameter.SHARED_LOGS_SECURITY_GROUP_ID }
         ].map(({ id, param }) =>
             SecurityGroup.fromSecurityGroupId(this, id, getMigrationStringParameterValue(this, {
                 ...props,
@@ -150,42 +151,14 @@ export class MigrationConsoleStack extends MigrationServiceCore {
             ...props,
             parameter: MigrationSSMParameter.OS_CLUSTER_ENDPOINT,
         });
-        const sourceClusterEndpoint = props.sourceClusterDisabled ? null : getMigrationStringParameterValue(this, {
-            ...props,
-            parameter: MigrationSSMParameter.SOURCE_CLUSTER_ENDPOINT,
-        });
         const brokerEndpoints = props.streamingSourceType != StreamingSourceType.DISABLED ?
             getMigrationStringParameterValue(this, {
                 ...props,
                 parameter: MigrationSSMParameter.KAFKA_BROKERS,
             }) : "";
 
-        const volumeName = "sharedReplayerOutputVolume"
-        const volumeId = getMigrationStringParameterValue(this, {
-            ...props,
-            parameter: MigrationSSMParameter.REPLAYER_OUTPUT_EFS_ID,
-        });
-        const replayerOutputEFSVolume: Volume = {
-            name: volumeName,
-            efsVolumeConfiguration: {
-                fileSystemId: volumeId,
-                transitEncryption: "ENABLED"
-            }
-        };
-        const replayerOutputMountPoint: MountPoint = {
-            containerPath: "/shared-replayer-output",
-            readOnly: false,
-            sourceVolume: volumeName
-        }
-        const replayerOutputEFSArn = `arn:${this.partition}:elasticfilesystem:${this.region}:${this.account}:file-system/${volumeId}`
-        const replayerOutputMountPolicy = new PolicyStatement( {
-            effect: Effect.ALLOW,
-            resources: [replayerOutputEFSArn],
-            actions: [
-                "elasticfilesystem:ClientMount",
-                "elasticfilesystem:ClientWrite"
-            ]
-        })
+        const sharedLogFileSystem = new SharedLogFileSystem(this, props.stage, props.defaultDeployId);
+
 
         const ecsClusterArn = `arn:${this.partition}:ecs:${this.region}:${this.account}:service/migration-${props.stage}-ecs-cluster`
         const allReplayerServiceArn = `${ecsClusterArn}/migration-${props.stage}-traffic-replayer*`
@@ -259,19 +232,17 @@ export class MigrationConsoleStack extends MigrationServiceCore {
             ]
         })
 
-        const getSecretsPolicy = props.servicesYaml.target_cluster.basic_auth?.password_from_secret_arn ? 
-            getTargetPasswordAccessPolicy(props.servicesYaml.target_cluster.basic_auth.password_from_secret_arn) : null;
+        const getTargetSecretsPolicy = props.servicesYaml.target_cluster.auth.basicAuth?.password_from_secret_arn ?
+            getSecretAccessPolicy(props.servicesYaml.target_cluster.auth.basicAuth?.password_from_secret_arn) : null;
+
+        const getSourceSecretsPolicy = props.sourceCluster?.auth.basicAuth?.password_from_secret_arn ?
+            getSecretAccessPolicy(props.sourceCluster?.auth.basicAuth?.password_from_secret_arn) : null;
 
         // Upload the services.yaml file to Parameter Store
-        let servicesYaml = props.servicesYaml
-        if (!props.sourceClusterDisabled && sourceClusterEndpoint) {
-            servicesYaml.source_cluster = {
-                'endpoint': sourceClusterEndpoint,
-                // TODO: We're not currently supporting auth here, this may need to be handled on the migration console
-                'no_auth': ''
-            }
-        }
+        const servicesYaml = props.servicesYaml
+        servicesYaml.source_cluster = props.sourceCluster
         servicesYaml.metadata_migration = new MetadataMigrationYaml();
+        servicesYaml.metadata_migration.source_cluster_version = props.sourceCluster?.version
         if (props.otelCollectorEnabled) {
             const otelSidecarEndpoint = OtelCollectorSidecar.getOtelLocalhostEndpoint();
             if (servicesYaml.metadata_migration) {
@@ -282,66 +253,48 @@ export class MigrationConsoleStack extends MigrationServiceCore {
             }
         }
 
+        const serviceTaskRole = new Role(this, 'MigrationServiceTaskRole', {
+            assumedBy: new ServicePrincipal('ecs-tasks.amazonaws.com'),
+            description: 'Role for Migration Console ECS Tasks',
+        });
+
+        const openSearchPolicy = createOpenSearchIAMAccessPolicy(this.partition, this.region, this.account)
+        const openSearchServerlessPolicy = createOpenSearchServerlessIAMAccessPolicy(this.partition, this.region, this.account)
+        let servicePolicies = [sharedLogFileSystem.asPolicyStatement(), openSearchPolicy, openSearchServerlessPolicy, ecsUpdateServicePolicy, clusterTasksPolicy,
+            listTasksPolicy, artifactS3PublishPolicy, describeVPCPolicy, getSSMParamsPolicy, getMetricsPolicy,
+            // only add secrets policies if they're non-null
+            ...(getTargetSecretsPolicy ? [getTargetSecretsPolicy] : []),
+            ...(getSourceSecretsPolicy ? [getSourceSecretsPolicy] : [])
+        ]
+
+        if (props.streamingSourceType === StreamingSourceType.AWS_MSK) {
+            const mskAdminPolicies = this.createMSKAdminIAMPolicies(props.stage, props.defaultDeployId)
+            servicePolicies = servicePolicies.concat(mskAdminPolicies)
+        }
+
+        if (props.managedServiceSourceSnapshotEnabled &&
+            servicesYaml.snapshot &&
+            servicesYaml.snapshot.s3) {
+            servicesYaml.snapshot.s3.role =
+                createSnapshotOnAOSRole(this, artifactS3Arn, serviceTaskRole.roleArn,
+                    this.region, props.stage, props.defaultDeployId)
+                    .roleArn;
+        }
+
         const parameter = createMigrationStringParameter(this, servicesYaml.stringify(), {
             ...props,
             parameter: MigrationSSMParameter.SERVICES_YAML_FILE,
         });
-        const environment: { [key: string]: string; } = {
+        const environment: Record<string, string> = {
             "MIGRATION_DOMAIN_ENDPOINT": osClusterEndpoint,
             "MIGRATION_KAFKA_BROKER_ENDPOINTS": brokerEndpoints,
             "MIGRATION_STAGE": props.stage,
             "MIGRATION_SOLUTION_VERSION": props.migrationsSolutionVersion,
             "MIGRATION_SERVICES_YAML_PARAMETER": parameter.parameterName,
             "MIGRATION_SERVICES_YAML_HASH": hashStringSHA256(servicesYaml.stringify()),
+            "SHARED_LOGS_DIR_PATH": `${sharedLogFileSystem.mountPointPath}/migration-console-${props.defaultDeployId}`,
         }
 
-        const openSearchPolicy = createOpenSearchIAMAccessPolicy(this.partition, this.region, this.account)
-        const openSearchServerlessPolicy = createOpenSearchServerlessIAMAccessPolicy(this.partition, this.region, this.account)
-        let servicePolicies = [replayerOutputMountPolicy, openSearchPolicy, openSearchServerlessPolicy, ecsUpdateServicePolicy, clusterTasksPolicy,
-            listTasksPolicy, artifactS3PublishPolicy, describeVPCPolicy, getSSMParamsPolicy, getMetricsPolicy,
-            ...(getSecretsPolicy ? [getSecretsPolicy] : []) // only add secrets policy if it's non-null
-        ]
-        if (props.streamingSourceType === StreamingSourceType.AWS_MSK) {
-            const mskAdminPolicies = this.createMSKAdminIAMPolicies(props.stage, props.defaultDeployId)
-            servicePolicies = servicePolicies.concat(mskAdminPolicies)
-        }
-        if (props.fetchMigrationEnabled) {
-            environment["FETCH_MIGRATION_COMMAND"] = getMigrationStringParameterValue(this, {
-                ...props,
-                parameter: MigrationSSMParameter.FETCH_MIGRATION_COMMAND,
-            });
-
-            const fetchMigrationTaskDefArn = getMigrationStringParameterValue(this, {
-                ...props,
-                parameter: MigrationSSMParameter.FETCH_MIGRATION_TASK_DEF_ARN,
-            });
-            const fetchMigrationTaskRunPolicy = new PolicyStatement({
-                effect: Effect.ALLOW,
-                resources: [fetchMigrationTaskDefArn],
-                actions: [
-                    "ecs:RunTask",
-                    "ecs:StopTask"
-                ]
-            })
-            const fetchMigrationTaskRoleArn = getMigrationStringParameterValue(this, {
-                ...props,
-                parameter: MigrationSSMParameter.FETCH_MIGRATION_TASK_ROLE_ARN,
-            });
-            const fetchMigrationTaskExecRoleArn = getMigrationStringParameterValue(this, {
-                ...props,
-                parameter: MigrationSSMParameter.FETCH_MIGRATION_TASK_EXEC_ROLE_ARN,
-            });
-            // Required as per https://docs.aws.amazon.com/AmazonECS/latest/userguide/task-iam-roles.html
-            const fetchMigrationPassRolePolicy = new PolicyStatement({
-                effect: Effect.ALLOW,
-                resources: [fetchMigrationTaskRoleArn, fetchMigrationTaskExecRoleArn],
-                actions: [
-                    "iam:PassRole"
-                ]
-            })
-            servicePolicies.push(fetchMigrationTaskRunPolicy)
-            servicePolicies.push(fetchMigrationPassRolePolicy)
-        }
 
         if (props.migrationAPIEnabled) {
             servicePortMappings = [{
@@ -356,16 +309,6 @@ export class MigrationConsoleStack extends MigrationServiceCore {
 
             const defaultAllowedHosts = 'localhost'
             environment["API_ALLOWED_HOSTS"] = props.migrationAPIAllowedHosts ? `${defaultAllowedHosts},${props.migrationAPIAllowedHosts}` : defaultAllowedHosts
-            const migrationApiUrl = getMigrationStringParameterValue(this, {
-                ...props,
-                parameter: MigrationSSMParameter.MIGRATION_API_URL
-            });
-            const migrationApiUrlAlias = getMigrationStringParameterValue(this, {
-                ...props,
-                parameter: MigrationSSMParameter.MIGRATION_API_URL_ALIAS
-            });
-            environment["API_ALLOWED_HOSTS"] += migrationApiUrl ? `,${this.getHostname(migrationApiUrl)}` : ""
-            environment["API_ALLOWED_HOSTS"] += migrationApiUrlAlias ? `,${this.getHostname(migrationApiUrlAlias)}` : ""
         }
 
         if (props.migrationConsoleEnableOSI) {
@@ -382,22 +325,23 @@ export class MigrationConsoleStack extends MigrationServiceCore {
                 parameter: MigrationSSMParameter.OSI_PIPELINE_LOG_GROUP_NAME,
             });
         }
+
         this.createService({
             serviceName: "migration-console",
-            dockerDirectoryPath: join(__dirname, "../../../../../", "TrafficCapture/dockerSolution/src/main/docker/migrationConsole"),
+            dockerImageName: "migrations/migration_console:latest",
             securityGroups: securityGroups,
             portMappings: servicePortMappings,
             dockerImageCommand: imageCommand,
-            volumes: [replayerOutputEFSVolume],
-            mountPoints: [replayerOutputMountPoint],
+            volumes: [sharedLogFileSystem.asVolume()],
+            mountPoints: [sharedLogFileSystem.asMountPoint()],
             environment: environment,
+            taskRole: serviceTaskRole,
             taskRolePolicies: servicePolicies,
             cpuArchitecture: props.fargateCpuArch,
-            taskCpuUnits: 1024,
-            taskMemoryLimitMiB: 2048,
+            taskCpuUnits: 2048,
+            taskMemoryLimitMiB: 4096,
             ...props
         });
-
     }
 
 }

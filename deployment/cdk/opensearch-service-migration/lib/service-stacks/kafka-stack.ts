@@ -20,7 +20,7 @@ export class KafkaStack extends MigrationServiceCore {
 
     constructor(scope: Construct, id: string, props: KafkaBrokerProps) {
         super(scope, id, props)
-        let securityGroups = [
+        const securityGroups = [
             { id: "serviceSG", param: MigrationSSMParameter.SERVICE_SECURITY_GROUP_ID },
             { id: "trafficStreamSourceAccessSG", param: MigrationSSMParameter.TRAFFIC_STREAM_SOURCE_ACCESS_SECURITY_GROUP_ID }
         ].map(({ id, param }) =>
@@ -42,7 +42,7 @@ export class KafkaStack extends MigrationServiceCore {
         });
         this.createService({
             serviceName: "kafka",
-            dockerImageRegistryName: "docker.io/apache/kafka:3.7.0",
+            dockerImageName: "docker.io/apache/kafka:3.7.0",
             securityGroups: securityGroups,
             // see https://github.com/apache/kafka/blob/3.7/docker/examples/jvm/single-node/plaintext/docker-compose.yml
             environment: {

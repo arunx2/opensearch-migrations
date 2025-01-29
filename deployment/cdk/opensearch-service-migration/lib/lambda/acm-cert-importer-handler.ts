@@ -10,28 +10,31 @@ import * as forge from 'node-forge';
 export const handler = async (event: CloudFormationCustomResourceEvent, context: Context): Promise<CloudFormationCustomResourceResponse> => {
   console.log('Received event:', JSON.stringify(event, null, 2));
   console.log('Received context:', JSON.stringify(context, null, 2));
-  let responseData: { [key: string]: any } = {};
-  let physicalResourceId: string = '';
+  let responseData: { CertificateArn?: string } = {};
+  let physicalResourceId = '';
 
   try {
     switch (event.RequestType) {
-      case 'Create':
+      case 'Create': {
         const { certificate, privateKey, certificateChain } = await generateSelfSignedCertificate();
         const certificateArn = await importCertificate(certificate, privateKey, certificateChain);
         console.log(`Certificate imported with ARN: ${certificateArn}`);
         responseData = { CertificateArn: certificateArn };
         physicalResourceId = certificateArn;
         break;
-      case 'Update':
+      }
+      case 'Update': {
         // No update logic needed, return existing physical resource id
         physicalResourceId = event.PhysicalResourceId;
-        break;  
-      case 'Delete':
+        break;
+      }
+      case 'Delete': {
         const arn = event.PhysicalResourceId;
         await deleteCertificate(arn);
         responseData = { CertificateArn: arn };
         physicalResourceId = arn;
         break;
+      }
     }
 
     return await sendResponse(event, context, 'SUCCESS', responseData, physicalResourceId);
@@ -42,10 +45,10 @@ export const handler = async (event: CloudFormationCustomResourceEvent, context:
 };
 
 async function generateSelfSignedCertificate(): Promise<{ certificate: string, privateKey: string, certificateChain: string }> {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const keys = forge.pki.rsa.generateKeyPair(2048);
     const cert = forge.pki.createCertificate();
-    
+
     cert.publicKey = keys.publicKey;
     cert.serialNumber = '01';
     cert.validity.notBefore = new Date(Date.UTC(1970, 0, 1, 0, 0, 0));
@@ -54,10 +57,10 @@ async function generateSelfSignedCertificate(): Promise<{ certificate: string, p
       name: 'commonName',
       value: 'localhost'
     }];
-  
+
     cert.setSubject(attrs);
     cert.setIssuer(attrs);
-  
+
     cert.setExtensions([{
       name: 'basicConstraints',
       cA: true
@@ -78,7 +81,7 @@ async function generateSelfSignedCertificate(): Promise<{ certificate: string, p
       clientAuth: true
     },]);
     cert.sign(keys.privateKey, forge.md.sha384.create());
-  
+
     const pemCert = forge.pki.certificateToPem(cert);
     const pemKey = forge.pki.privateKeyToPem(keys.privateKey);
 
@@ -100,7 +103,10 @@ async function importCertificate(certificate: string, privateKey: string, certif
   });
 
   const response = await client.send(command);
-  return response.CertificateArn!;
+  if (!response.CertificateArn) {
+    throw new Error(`Unexpected response, no certificate arn in response`);
+  }
+  return response.CertificateArn;
 }
 
 async function deleteCertificate(certificateArn: string): Promise<void> {
@@ -112,7 +118,8 @@ async function deleteCertificate(certificateArn: string): Promise<void> {
   await client.send(command);
 }
 
-async function sendResponse(event: CloudFormationCustomResourceEvent, context: Context, responseStatus: string, responseData: { [key: string]: any }, physicalResourceId: string): Promise<CloudFormationCustomResourceResponse> {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function sendResponse(event: CloudFormationCustomResourceEvent, context: Context, responseStatus: string, responseData: Record<string, any>, physicalResourceId: string): Promise<CloudFormationCustomResourceResponse> {
   const responseBody = JSON.stringify({
     Status: responseStatus,
     Reason: `See the details in CloudWatch Log Stream: ${context.logStreamName}`,
@@ -165,7 +172,7 @@ async function sendResponse(event: CloudFormationCustomResourceEvent, context: C
       });
     });
 
-    request.on('error', (error) => {
+    request.on('error', (error: Error) => {
       console.error('sendResponse Error:', error);
       reject(error);
     });

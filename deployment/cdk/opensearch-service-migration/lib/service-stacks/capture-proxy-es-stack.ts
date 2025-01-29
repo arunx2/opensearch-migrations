@@ -2,14 +2,12 @@ import {StackPropsExt} from "../stack-composer";
 import {IVpc, SecurityGroup} from "aws-cdk-lib/aws-ec2";
 import {CpuArchitecture, PortMapping, Protocol} from "aws-cdk-lib/aws-ecs";
 import {Construct} from "constructs";
-import {join} from "path";
 import {ELBTargetGroup, MigrationServiceCore} from "./migration-service-core";
 import {StreamingSourceType} from "../streaming-source-type";
 import {
     MigrationSSMParameter,
     createMSKProducerIAMPolicies,
-    getMigrationStringParameterValue,
-    parseAndMergeArgs
+    getMigrationStringParameterValue, parseArgsToDict, appendArgIfNotInExtraArgs,
 } from "../common-utilities";
 import {OtelCollectorSidecar} from "./migration-otel-collector-sidecar";
 
@@ -34,7 +32,7 @@ export class CaptureProxyESStack extends MigrationServiceCore {
 
     constructor(scope: Construct, id: string, props: CaptureProxyESProps) {
         super(scope, id, props)
-        let securityGroups = [
+        const securityGroups = [
             { id: "serviceSG", param: MigrationSSMParameter.SERVICE_SECURITY_GROUP_ID },
             { id: "trafficStreamSourceAccessSG", param: MigrationSSMParameter.TRAFFIC_STREAM_SOURCE_ACCESS_SECURITY_GROUP_ID }
         ].map(({ id, param }) =>
@@ -63,15 +61,26 @@ export class CaptureProxyESStack extends MigrationServiceCore {
             ...props,
             parameter: MigrationSSMParameter.KAFKA_BROKERS,
         });
-        let command = `/usr/local/bin/docker-entrypoint.sh eswrapper & /runJavaWithClasspath.sh org.opensearch.migrations.trafficcapture.proxyserver.CaptureProxy --destinationUri https://localhost:19200 --insecureDestination --listenPort 9200 --sslConfigFile /usr/share/elasticsearch/config/proxy_tls.yml`
-        command = props.streamingSourceType !== StreamingSourceType.DISABLED ? command.concat(`  --kafkaConnection ${brokerEndpoints}`) : command
-        command = props.streamingSourceType === StreamingSourceType.AWS_MSK ? command.concat(" --enableMSKAuth") : command
-        command = props.otelCollectorEnabled ? command.concat(` --otelCollectorEndpoint ${OtelCollectorSidecar.getOtelLocalhostEndpoint()}`) : command
-        command = parseAndMergeArgs(command, props.extraArgs);
+
+        let command = "/usr/local/bin/docker-entrypoint.sh eswrapper & /runJavaWithClasspath.sh org.opensearch.migrations.trafficcapture.proxyserver.CaptureProxy"
+        const extraArgsDict = parseArgsToDict(props.extraArgs)
+        command = appendArgIfNotInExtraArgs(command, extraArgsDict, "--destinationUri", "https://localhost:19200")
+        command = appendArgIfNotInExtraArgs(command, extraArgsDict, "--insecureDestination")
+        command = appendArgIfNotInExtraArgs(command, extraArgsDict, "--sslConfigFile", "/usr/share/captureProxy/config/proxy_tls.yml")
+        if (props.streamingSourceType !== StreamingSourceType.DISABLED) {
+            command = appendArgIfNotInExtraArgs(command, extraArgsDict, "--kafkaConnection", brokerEndpoints)
+        }
+        if (props.streamingSourceType === StreamingSourceType.AWS_MSK) {
+            command = appendArgIfNotInExtraArgs(command, extraArgsDict, "--enableMSKAuth")
+        }
+        if (props.otelCollectorEnabled) {
+            command = appendArgIfNotInExtraArgs(command, extraArgsDict, "--otelCollectorEndpoint", OtelCollectorSidecar.getOtelLocalhostEndpoint())
+        }
+        command = props.extraArgs?.trim() ? command.concat(` ${props.extraArgs?.trim()}`) : command
 
         this.createService({
             serviceName: "capture-proxy-es",
-            dockerDirectoryPath: join(__dirname, "../../../../../", "TrafficCapture/dockerSolution/build/docker/trafficCaptureProxyServer"),
+            dockerImageName: "migrations/capture_proxy_es:latest",
             dockerImageCommand: ['/bin/sh', '-c', command.concat(" & wait -n 1")],
             securityGroups: securityGroups,
             taskRolePolicies: servicePolicies,

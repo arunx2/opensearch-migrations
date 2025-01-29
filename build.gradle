@@ -1,8 +1,83 @@
 plugins {
-    id "com.dorongold.task-tree" version "2.1.1"
-    id 'io.freefair.lombok' version '8.6' apply false
+//    Observing higher memory usage with task-tree plugin. Disabling except if needed
+//    id "com.dorongold.task-tree" version "2.1.1"
     id "com.diffplug.spotless" version '6.25.0'
+    id 'io.freefair.lombok' version '8.6' apply false
+    id 'jacoco'
     id 'me.champeau.jmh' version '0.7.2' apply false
+}
+
+allprojects {
+    repositories {
+        mavenCentral()
+    }
+}
+
+
+// Ensure Capture Proxy and Dependencies are built with JDK 11 for On Node Install
+
+// Cache dependencies during the configuration phase
+ext.captureProxyDependencies = []
+gradle.projectsEvaluated {
+    def captureProxyProject = rootProject.project(":TrafficCapture:trafficCaptureProxyServer")
+    captureProxyDependencies = captureProxyProject.configurations.collectMany { configuration ->
+        configuration.dependencies.findAll { it instanceof ProjectDependency }.collect { it.dependencyProject.path }
+    }
+    // Add the TrafficCaptureProxyServer project itself
+    captureProxyDependencies << captureProxyProject.path
+}
+
+// Modify sourceCompatibility during the execution phase
+gradle.taskGraph.whenReady { taskGraph ->
+    allprojects {
+        tasks.withType(JavaCompile).configureEach {
+            if (project.path in rootProject.captureProxyDependencies) {
+                sourceCompatibility = JavaVersion.VERSION_11
+                targetCompatibility = JavaVersion.VERSION_11
+            } else {
+                sourceCompatibility = JavaVersion.VERSION_17
+                targetCompatibility = JavaVersion.VERSION_17
+            }
+        }
+    }
+}
+
+// Define version properties
+ext {
+    // support -Dbuild.version, but include default
+    buildVersion = System.getProperty("build.version", "0.1.0")
+    // support -Dbuild.snapshot=false, but default to true
+    buildSnapshot = System.getProperty("build.snapshot", "true") == "true"
+    finalVersion = buildSnapshot ? "${buildVersion}-SNAPSHOT" : buildVersion
+}
+
+allprojects {
+    version = finalVersion
+    // This should eventually change, see https://opensearch.atlassian.net/browse/MIGRATIONS-2167
+    group = 'org.opensearch.migrations.trafficcapture'
+    tasks.withType(Jar).tap {
+        configureEach {
+            manifest {
+                attributes(
+                        'SPDX-License-Identifier': 'Apache-2.0'
+                )
+            }
+        }
+    }
+}
+
+subprojects { subproject ->
+    subproject.afterEvaluate {
+        if (subproject.plugins.hasPlugin('java') && subproject.name != 'commonDependencyVersionConstraints') {
+            subproject.dependencies {
+                implementation project(":commonDependencyVersionConstraints")
+                annotationProcessor project(":commonDependencyVersionConstraints")
+                if (subproject.plugins.hasPlugin('java-test-fixtures')) {
+                    testFixturesImplementation project(":commonDependencyVersionConstraints")
+                }
+            }
+        }
+    }
 }
 
 task buildDockerImages() {
@@ -26,25 +101,38 @@ spotless {
         indentWithSpaces()
         endWithNewline()
     }
+    json {
+        target 'deployment/cdk/opensearch-service-migration/*.json'
+        prettier()
+        endWithNewline()
+    }
 }
 
 subprojects {
+    apply plugin: "com.diffplug.spotless"
     apply plugin: 'jacoco'
     apply plugin: 'java'
     apply plugin: 'maven-publish'
-    apply plugin: "com.diffplug.spotless"
 
+    java {
+        toolchain {
+            languageVersion.set(JavaLanguageVersion.of(17))
+            vendor.set(JvmVendorSpec.AMAZON)
+        }
+    }
+
+    // See https://github.com/diffplug/spotless/tree/main/plugin-gradle#java for some documentation,
+    // though what '#' does is still undocumented from what I can tell
     spotless {
         java {
             target "**/*.java"
             targetExclude '**/build/**', ".gradle/**"
             importOrder(
-                'java|javax',
-                'io.opentelemetry|com.google|com.fasterxml|org.apache|org.hamcrest|org.junit',
-                'org.opensearch',
-                '',
-                '\\#java|\\#org.apache|\\#org.hamcrest|\\#org.opensearch|\\#'
-            )
+                    'javax',
+                    'java',
+                    'org.opensearch',
+                    '',
+                    '\\#')
             indentWithSpaces()
             endWithNewline()
             removeUnusedImports()
@@ -54,6 +142,58 @@ subprojects {
     tasks.withType(Test) {
         // Getting javadoc to compile is part of the test suite to ensure we are able to publish our artifacts
         dependsOn project.javadoc
+
+        testLogging {
+            events "passed", "skipped", "failed"
+            exceptionFormat "full"
+            showExceptions true
+            showCauses true
+            showStackTraces true
+        }
+        maxParallelForks = gradle.startParameter.maxWorkerCount
+
+        // Provide way to exclude particular tests from CLI
+        // e.g. ../gradlew test -PexcludeTests=**/KafkaProtobufConsumerLongTermTest*
+        if (project.hasProperty('excludeTests')) {
+            exclude project.property('excludeTests')
+        }
+
+        useJUnitPlatform()
+        //  Disable parallel test execution, see MIGRATIONS-1666
+        systemProperty 'junit.jupiter.execution.parallel.enabled', 'false'
+        systemProperty 'log4j2.contextSelector', 'org.apache.logging.log4j.core.selector.BasicContextSelector'
+        // Verify assertions in tests
+        jvmArgs = ['-ea', '-XX:+HeapDumpOnOutOfMemoryError']
+        jacoco.enabled = true
+    }
+
+    // Mutually exclusive tests to avoid duplication
+    tasks.named('test') {
+        systemProperty 'migrationLogLevel', 'TRACE'
+        useJUnitPlatform {
+            excludeTags('longTest', 'isolatedTest')
+        }
+    }
+
+    tasks.register('slowTest', Test) {
+        systemProperty 'migrationLogLevel', 'DEBUG'
+        useJUnitPlatform {
+            includeTags 'longTest'
+            excludeTags 'isolatedTest'
+        }
+    }
+
+    tasks.register('isolatedTest', Test) {
+        maxParallelForks = 1
+        useJUnitPlatform {
+            includeTags 'isolatedTest'
+        }
+    }
+
+    tasks.register('fullTest') {
+        dependsOn test
+        dependsOn slowTest
+        dependsOn isolatedTest
     }
 
     task javadocJar(type: Jar, dependsOn: javadoc) {
@@ -64,8 +204,9 @@ subprojects {
     task sourcesJar(type: Jar) {
         archiveClassifier.set('sources')
         from sourceSets.main.allSource
-        duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+        duplicatesStrategy = DuplicatesStrategy.WARN
     }
+
     def excludedProjectPaths = [
             ':RFS',
             ':TrafficCapture',
@@ -75,19 +216,21 @@ subprojects {
         publishing {
             publications {
                 mavenJava(MavenPublication) {
+                    versionMapping {
+                        allVariants {
+                            // Test fixtures are published as a separate jar in maven
+                            // This ensures dependencies that are only declared in test
+                            // fixtures have a version number in the pom
+                            if (project.plugins.hasPlugin('java-test-fixtures')) {
+                                fromResolutionOf('testFixturesRuntimeClasspath')
+                            }
+                            fromResolutionResult()
+                        }
+                    }
+
                     from components.java
                     artifact javadocJar
                     artifact sourcesJar
-
-                    group = 'org.opensearch.migrations.trafficcapture'
-
-                    // support -Dbuild.version, but include default
-                    version = System.getProperty("build.version", "0.1.0")
-
-                    // support -Dbuild.snapshot=false, but default to true
-                    if (System.getProperty("build.snapshot", "true") == "true") {
-                        version += "-SNAPSHOT"
-                    }
 
                     pom {
                         name = project.name
@@ -113,6 +256,24 @@ subprojects {
                         }
                     }
 
+                    pom.withXml {
+                        def pomFile = asNode()
+
+                        // Find all dependencies in the POM file
+                        def dependencies = pomFile.dependencies.dependency
+
+                        // Iterate over each dependency and check if the version is missing
+                        dependencies.each { dependency ->
+                            def version = dependency.version.text()
+
+                            if (version == null || version.trim().isEmpty() || version.trim() == 'unspecified') {
+                                def groupId = dependency.groupId.text()
+                                def artifactId = dependency.artifactId.text()
+                                throw new GradleException("Dependency ${groupId}:${artifactId} is missing a version in the pom.xml")
+                            }
+                        }
+                    }
+
                     // Suppress POM metadata warnings for test fixtures
                     suppressPomMetadataWarningsFor('testFixturesApiElements')
                     suppressPomMetadataWarningsFor('testFixturesRuntimeElements')
@@ -130,19 +291,73 @@ subprojects {
 
     // Utility task to allow copying required libraries into a 'dependencies' folder for security scanning
     tasks.register('copyDependencies', Sync) {
-        duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+        duplicatesStrategy = DuplicatesStrategy.WARN
 
         from configurations.runtimeClasspath
         into "${buildDir}/dependencies"
     }
 
     jacocoTestReport {
+        dependsOn = project.tasks.withType(Test).matching { it.jacoco && it.jacoco.enabled }
+        executionData.from = project.tasks.withType(Test).matching { it.jacoco && it.jacoco.enabled }.collect { it.jacoco.destinationFile }
+        classDirectories.from = files(subprojects.collect { it.sourceSets.main.output.classesDirs })
         reports {
             xml.required = true
             xml.destination file("${buildDir}/reports/jacoco/test/jacocoTestReport.xml")
             html.required = true
             html.destination file("${buildDir}/reports/jacoco/test/html")
         }
+    }
+}
+
+gradle.projectsEvaluated {
+    List<Task> isolatedTestsTasks = []
+    List<Task> sharedProcessTestsTasks = []
+    subprojects { subproject ->
+        subproject.tasks.withType(Test).all { task ->
+            if (task.name == "isolatedTest") {
+                isolatedTestsTasks.add(task)
+            } else {
+                sharedProcessTestsTasks.add(task)
+            }
+        }
+    }
+    isolatedTestsTasks.sort { task -> task.project.name }
+
+    // Create a sequential dependency chain
+    Task previousTask = null
+    isolatedTestsTasks.each { task ->
+        sharedProcessTestsTasks.forEach {task.mustRunAfter(it) }
+        if (previousTask != null) {
+            task.mustRunAfter(previousTask)
+        }
+        previousTask = task
+    }
+
+    tasks.register("allTests") {
+        dependsOn sharedProcessTestsTasks
+        dependsOn isolatedTestsTasks
+    }
+}
+
+task mergeJacocoReports(type: JacocoReport) {
+    def jacocoReportTasks = subprojects.collect { it.tasks.withType(JacocoReport).matching { it.name == "jacocoTestReport" } }.flatten()
+    dependsOn jacocoReportTasks
+
+    additionalSourceDirs.setFrom(files(jacocoReportTasks.collect { it.additionalSourceDirs }.flatten()))
+    sourceDirectories.setFrom(files(jacocoReportTasks.collect { it.sourceDirectories }.flatten()))
+    classDirectories.setFrom(files(subprojects.collect { subproject ->
+        subproject.sourceSets.main.output.classesDirs.filter { dir ->
+            !dir.path.contains('captureProtobufs') && !dir.path.contains('trafficCaptureProxyServerTest')
+        }
+    }))
+    executionData.setFrom(files(jacocoReportTasks.collect { it.executionData }.flatten()))
+
+    reports {
+        xml.required = true
+        xml.destination = file("${buildDir}/reports/jacoco/mergedReport/jacocoMergedReport.xml")
+        html.required = true
+        html.destination = file("${buildDir}/reports/jacoco/mergedReport/html")
     }
 }
 

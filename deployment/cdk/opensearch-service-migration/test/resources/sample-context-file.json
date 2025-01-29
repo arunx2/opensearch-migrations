@@ -5,6 +5,10 @@
     "migrationAssistanceEnabled": true,
     "kafkaBrokerServiceEnabled": true,
     "otelCollectorEnabled": false,
-    "sourceClusterEndpoint": "https://test-cluster"
+    "sourceCluster": {
+      "endpoint": "https://test-cluster",
+      "version": "ES_7.10",
+      "auth": { "type": "none" }
+    }
   }
 }

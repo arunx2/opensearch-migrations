@@ -10,19 +10,9 @@ import java.util.Optional;
 import java.util.Random;
 import java.util.stream.Collectors;
 
-import io.opentelemetry.sdk.trace.data.SpanData;
-import com.google.protobuf.ByteString;
-import com.google.protobuf.Timestamp;
-import org.junit.jupiter.api.Assertions;
-import org.junit.jupiter.api.Tag;
-import org.junit.jupiter.api.parallel.ResourceLock;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
-
 import org.opensearch.migrations.replay.RootReplayerConstructorExtensions;
 import org.opensearch.migrations.replay.TestHttpServerContext;
 import org.opensearch.migrations.replay.TimeShifter;
-import org.opensearch.migrations.replay.TransformationLoader;
 import org.opensearch.migrations.replay.traffic.source.ArrayCursorTrafficCaptureSource;
 import org.opensearch.migrations.replay.traffic.source.ArrayCursorTrafficSourceContext;
 import org.opensearch.migrations.replay.traffic.source.BlockingTrafficSource;
@@ -37,8 +27,17 @@ import org.opensearch.migrations.trafficcapture.protos.TrafficObservation;
 import org.opensearch.migrations.trafficcapture.protos.TrafficStream;
 import org.opensearch.migrations.trafficcapture.protos.WriteObservation;
 import org.opensearch.migrations.transform.StaticAuthTransformerFactory;
+import org.opensearch.migrations.transform.TransformationLoader;
 
+import com.google.protobuf.ByteString;
+import com.google.protobuf.Timestamp;
+import io.opentelemetry.sdk.trace.data.SpanData;
 import lombok.extern.slf4j.Slf4j;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Tag;
+import org.junit.jupiter.api.parallel.ResourceLock;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 @Slf4j
 @WrapWithNettyLeakDetection(disableLeakChecks = true)
@@ -52,6 +51,7 @@ public class FullReplayerWithTracingChecksTest extends FullTrafficReplayerTest {
     @ParameterizedTest
     @ValueSource(ints = { 1, 2 })
     @ResourceLock("TrafficReplayerRunner")
+    // run in isolation to reduce the chance that there's a broken connection, upsetting the tcpConnection count check
     @Tag("longTest")
     public void testStreamWithRequestsWithCloseIsCommittedOnce(int numRequests) throws Throwable {
         var random = new Random(1);
@@ -80,7 +80,7 @@ public class FullReplayerWithTracingChecksTest extends FullTrafficReplayerTest {
                                             + i
                                             + " HTTP/1.1\r\n"
                                             + "Connection: Keep-Alive\r\n"
-                                            + "Host: localhost\r\n").getBytes(StandardCharsets.UTF_8)
+                                            + "Host: localhost\r\n\r\n").getBytes(StandardCharsets.UTF_8)
                                     )
                                 )
                                 .build()
@@ -126,8 +126,8 @@ public class FullReplayerWithTracingChecksTest extends FullTrafficReplayerTest {
                     rootContext,
                     serverUri,
                     new StaticAuthTransformerFactory("TEST"),
-                    new TransformationLoader().getTransformerFactoryLoader(serverUri.getHost()),
-                    RootReplayerConstructorExtensions.makeClientConnectionPool(serverUri, 10),
+                    new TransformationLoader().getTransformerFactoryLoaderWithNewHostName(serverUri.getHost()),
+                    RootReplayerConstructorExtensions.makeNettyPacketConsumerConnectionPool(serverUri, 10),
                     10 * 1024
                 );
                 var blockingTrafficSource = new BlockingTrafficSource(trafficSource, Duration.ofMinutes(2))
@@ -191,6 +191,7 @@ public class FullReplayerWithTracingChecksTest extends FullTrafficReplayerTest {
         Assertions.assertEquals(numRequests, traceProcessor.getCountAndRemoveSpan("targetTransaction"));
         Assertions.assertEquals(numRequests * 2, traceProcessor.getCountAndRemoveSpan("scheduled"));
         Assertions.assertEquals(numRequests, traceProcessor.getCountAndRemoveSpan("requestSending"));
+        Assertions.assertEquals(1, traceProcessor.getCountAndRemoveSpan("requestConnecting"));
         Assertions.assertEquals(numRequests, traceProcessor.getCountAndRemoveSpan("comparingResults"));
 
         Assertions.assertTrue(traceProcessor.getCountAndRemoveSpan("waitingForResponse") > 0);

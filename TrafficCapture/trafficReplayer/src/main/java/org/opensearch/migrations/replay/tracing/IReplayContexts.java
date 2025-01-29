@@ -2,18 +2,18 @@ package org.opensearch.migrations.replay.tracing;
 
 import java.time.Instant;
 
-import io.opentelemetry.api.common.AttributeKey;
-import io.opentelemetry.api.common.AttributesBuilder;
-
 import org.opensearch.migrations.replay.datatypes.ISourceTrafficChannelKey;
 import org.opensearch.migrations.replay.datatypes.ITrafficStreamKey;
 import org.opensearch.migrations.replay.datatypes.UniqueReplayerRequestKey;
 import org.opensearch.migrations.tracing.IScopedInstrumentationAttributes;
 import org.opensearch.migrations.tracing.IWithTypedEnclosingScope;
 
-public abstract class IReplayContexts {
+import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.api.common.AttributesBuilder;
 
-    public static class ActivityNames {
+public interface IReplayContexts {
+
+    class ActivityNames {
         private ActivityNames() {}
 
         public static final String CHANNEL = "channel";
@@ -26,13 +26,14 @@ public abstract class IReplayContexts {
         public static final String TRANSFORMATION = "transformation";
         public static final String SCHEDULED = "scheduled";
         public static final String TARGET_TRANSACTION = "targetTransaction";
+        public static final String REQUEST_CONNECTING = "requestConnecting";
         public static final String REQUEST_SENDING = "requestSending";
         public static final String WAITING_FOR_RESPONSE = "waitingForResponse";
         public static final String RECEIVING_RESPONSE = "receivingResponse";
         public static final String TUPLE_COMPARISON = "comparingResults";
     }
 
-    public static class MetricNames {
+    class MetricNames {
         private MetricNames() {}
 
         public static final String KAFKA_RECORD_READ = "kafkaRecordsRead";
@@ -43,6 +44,9 @@ public abstract class IReplayContexts {
         public static final String TRANSFORM_PAYLOAD_PARSE_SUCCESS = "parsedPayloadSuccess";
         public static final String TRANSFORM_JSON_REQUIRED = "transformedJsonRequired";
         public static final String TRANSFORM_JSON_SUCCEEDED = "transformedJsonSucceeded";
+        public static final String TRANSFORM_TEXT_SUCCEEDED = "transformedTextSucceeded";
+        public static final String TRANSFORM_TEXT_FAILED = "transformedTextFailed";
+        public static final String TRANSFORM_PAYLOAD_BINARY = "transformedPayloadBinary";
         public static final String TRANSFORM_PAYLOAD_BYTES_IN = "originalPayloadBytesIn";
         public static final String TRANSFORM_UNCOMPRESSED_BYTES_IN = "uncompressedBytesIn";
         public static final String TRANSFORM_UNCOMPRESSED_BYTES_OUT = "uncompressedBytesOut";
@@ -55,9 +59,10 @@ public abstract class IReplayContexts {
         public static final String TRANSFORM_CHUNKS_IN = "transformChunksIn";
         public static final String TRANSFORM_CHUNKS_OUT = "transformChunksOut";
         public static final String NETTY_SCHEDULE_LAG = "scheduleLag";
+        public static final String NUM_REQUEST_RETRIES = "numRetriedRequests";
         public static final String SOURCE_TO_TARGET_REQUEST_LAG = "lagBetweenSourceAndTargetRequests";
         public static final String ACTIVE_CHANNELS_YET_TO_BE_FULLY_DISCARDED = "activeReplayerChannels";
-        public static final String FAILED_CONNECTION_ATTEMPTS = "failedConnectionAttempts";
+        public static final String NONRETRYABLE_CONNECTION_FAILURES = "nonRetryableConnectionFailures";
         public static final String ACTIVE_TARGET_CONNECTIONS = "activeTargetConnections";
         public static final String CONNECTIONS_OPENED = "connectionsOpened";
         public static final String CONNECTIONS_CLOSED = "connectionsClosedCount";
@@ -66,9 +71,9 @@ public abstract class IReplayContexts {
         public static final String TUPLE_COMPARISON = "tupleComparison";
     }
 
-    public interface IAccumulationScope extends IScopedInstrumentationAttributes {}
+    interface IAccumulationScope extends IScopedInstrumentationAttributes {}
 
-    public interface IChannelKeyContext
+    interface IChannelKeyContext
         extends
             IAccumulationScope,
             org.opensearch.migrations.tracing.commoncontexts.IConnectionContext {
@@ -96,7 +101,7 @@ public abstract class IReplayContexts {
         void addFailedChannelCreation();
     }
 
-    public interface ISocketContext extends IAccumulationScope, IWithTypedEnclosingScope<IChannelKeyContext> {
+    interface ISocketContext extends IAccumulationScope, IWithTypedEnclosingScope<IChannelKeyContext> {
         public static final String ACTIVITY_NAME = ActivityNames.TCP_CONNECTION;
 
         @Override
@@ -105,7 +110,7 @@ public abstract class IReplayContexts {
         }
     }
 
-    public interface IKafkaRecordContext extends IAccumulationScope, IWithTypedEnclosingScope<IChannelKeyContext> {
+    interface IKafkaRecordContext extends IAccumulationScope, IWithTypedEnclosingScope<IChannelKeyContext> {
         String ACTIVITY_NAME = ActivityNames.RECORD_LIFETIME;
 
         @Override
@@ -125,7 +130,7 @@ public abstract class IReplayContexts {
         ITrafficStreamsLifecycleContext createTrafficLifecyleContext(ITrafficStreamKey tsk);
     }
 
-    public interface ITrafficStreamsLifecycleContext
+    interface ITrafficStreamsLifecycleContext
         extends
             IAccumulationScope,
             IWithTypedEnclosingScope<IChannelKeyContext> {
@@ -154,7 +159,7 @@ public abstract class IReplayContexts {
         );
     }
 
-    public interface IReplayerHttpTransactionContext
+    interface IReplayerHttpTransactionContext
         extends
             org.opensearch.migrations.tracing.commoncontexts.IHttpTransactionContext,
             IAccumulationScope,
@@ -210,7 +215,7 @@ public abstract class IReplayContexts {
         ITupleHandlingContext createTupleContext();
     }
 
-    public interface IRequestAccumulationContext
+    interface IRequestAccumulationContext
         extends
             IAccumulationScope,
             IWithTypedEnclosingScope<IReplayerHttpTransactionContext> {
@@ -222,7 +227,7 @@ public abstract class IReplayContexts {
         }
     }
 
-    public interface IResponseAccumulationContext
+    interface IResponseAccumulationContext
         extends
             IAccumulationScope,
             IWithTypedEnclosingScope<IReplayerHttpTransactionContext> {
@@ -234,7 +239,7 @@ public abstract class IReplayContexts {
         }
     }
 
-    public interface IRequestTransformationContext
+    interface IRequestTransformationContext
         extends
             IAccumulationScope,
             IWithTypedEnclosingScope<IReplayerHttpTransactionContext> {
@@ -255,6 +260,12 @@ public abstract class IReplayContexts {
 
         void onJsonPayloadParseSucceeded();
 
+        void onTextPayloadParseSucceeded();
+
+        void onTextPayloadParseFailed();
+
+        void onPayloadSetBinary();
+
         void onPayloadBytesIn(int inputSize);
 
         void onUncompressedBytesIn(int inputSize);
@@ -274,7 +285,7 @@ public abstract class IReplayContexts {
         void aggregateOutputChunk(int sizeInBytes);
     }
 
-    public interface IScheduledContext
+    interface IScheduledContext
         extends
             IAccumulationScope,
             IWithTypedEnclosingScope<IReplayerHttpTransactionContext> {
@@ -286,7 +297,7 @@ public abstract class IReplayContexts {
         }
     }
 
-    public interface ITargetRequestContext
+    interface ITargetRequestContext
         extends
             IAccumulationScope,
             IWithTypedEnclosingScope<IReplayerHttpTransactionContext> {
@@ -301,6 +312,8 @@ public abstract class IReplayContexts {
 
         void onBytesReceived(int size);
 
+        IRequestConnectingContext createHttpConnectingContext();
+
         IRequestSendingContext createHttpSendingContext();
 
         IWaitingForHttpResponseContext createWaitingForResponseContext();
@@ -308,10 +321,22 @@ public abstract class IReplayContexts {
         IReceivingHttpResponseContext createHttpReceivingContext();
     }
 
-    public interface IRequestSendingContext
+    interface IRequestConnectingContext
         extends
-            IAccumulationScope,
-            IWithTypedEnclosingScope<ITargetRequestContext> {
+        IAccumulationScope,
+        IWithTypedEnclosingScope<ITargetRequestContext> {
+        String ACTIVITY_NAME = ActivityNames.REQUEST_CONNECTING;
+
+        @Override
+        default String getActivityName() {
+            return ACTIVITY_NAME;
+        }
+    }
+
+    interface IRequestSendingContext
+        extends
+        IAccumulationScope,
+        IWithTypedEnclosingScope<ITargetRequestContext> {
         String ACTIVITY_NAME = ActivityNames.REQUEST_SENDING;
 
         @Override
@@ -320,7 +345,7 @@ public abstract class IReplayContexts {
         }
     }
 
-    public interface IWaitingForHttpResponseContext
+    interface IWaitingForHttpResponseContext
         extends
             IAccumulationScope,
             IWithTypedEnclosingScope<ITargetRequestContext> {
@@ -332,7 +357,7 @@ public abstract class IReplayContexts {
         }
     }
 
-    public interface IReceivingHttpResponseContext
+    interface IReceivingHttpResponseContext
         extends
             IAccumulationScope,
             IWithTypedEnclosingScope<ITargetRequestContext> {
@@ -344,7 +369,7 @@ public abstract class IReplayContexts {
         }
     }
 
-    public interface ITupleHandlingContext
+    interface ITupleHandlingContext
         extends
             IAccumulationScope,
             IWithTypedEnclosingScope<IReplayerHttpTransactionContext> {

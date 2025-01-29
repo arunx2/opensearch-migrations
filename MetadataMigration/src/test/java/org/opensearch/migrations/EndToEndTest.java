@@ -1,119 +1,252 @@
 package org.opensearch.migrations;
 
-import java.io.File;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
+import org.opensearch.migrations.bulkload.SupportedClusters;
+import org.opensearch.migrations.bulkload.framework.SearchClusterContainer;
+import org.opensearch.migrations.bulkload.models.DataFilterArgs;
+import org.opensearch.migrations.commands.MigrationItemResult;
+import org.opensearch.migrations.metadata.CreationResult;
+
+import lombok.SneakyThrows;
+import lombok.extern.slf4j.Slf4j;
+import org.hamcrest.Matcher;
 import org.hamcrest.Matchers;
 import org.junit.jupiter.api.Tag;
-import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
-import org.opensearch.migrations.metadata.tracing.MetadataMigrationTestContext;
-import org.opensearch.migrations.snapshot.creation.tracing.SnapshotTestContext;
-
-import com.rfs.common.FileSystemSnapshotCreator;
-import com.rfs.common.OpenSearchClient;
-import com.rfs.common.http.ConnectionContext.TargetArgs;
-import com.rfs.common.http.ConnectionContextTestParams;
-import com.rfs.framework.SearchClusterContainer;
-import com.rfs.http.ClusterOperations;
-import com.rfs.worker.SnapshotRunner;
-import lombok.SneakyThrows;
-
+import static org.hamcrest.CoreMatchers.allOf;
+import static org.hamcrest.CoreMatchers.containsString;
 import static org.hamcrest.CoreMatchers.equalTo;
+import static org.hamcrest.CoreMatchers.not;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.containsInAnyOrder;
 
 /**
- * Tests focused on setting up whole source clusters, performing a migration, and validation on the target cluster
+ * Tests focused on setting up whole source clusters, performing a migration, and validation on the target cluster.
  */
-@Tag("longTest")
-class EndToEndTest {
+@Tag("isolatedTest")
+@Slf4j
+class EndToEndTest extends BaseMigrationTest {
 
-    @TempDir
-    private File localDirectory;
+    private static Stream<Arguments> scenarios() {
+        return SupportedClusters.sources().stream()
+            .flatMap(sourceCluster -> {
+                // Determine applicable template types based on source version
+                List<TemplateType> templateTypes = Stream.concat(
+                        Stream.of(TemplateType.Legacy),
+                        (sourceCluster.getVersion().getMajor() >= 7
+                            ? Stream.of(TemplateType.Index, TemplateType.IndexAndComponent)
+                            : Stream.empty()))
+                    .collect(Collectors.toList());
 
-    @Test
-    void metadataMigrateFrom_ES_v7_10_to_OS_v2_14() throws Exception {
-        final var targetVersion = SearchClusterContainer.OS_V2_14_0;
+                return SupportedClusters.targets().stream()
+                    .flatMap(targetCluster -> Arrays.stream(TransferMedium.values())
+                        .map(transferMedium -> Arguments.of(
+                            sourceCluster,
+                            targetCluster,
+                            transferMedium,
+                            templateTypes)))
+                    .collect(Collectors.toList()).stream();
+            });
+    }
+
+    @ParameterizedTest(name = "From version {0} to version {1}, Medium {2}, Command {3}, Template Type {4}")
+    @MethodSource(value = "scenarios")
+    void metadataCommand(SearchClusterContainer.ContainerVersion sourceVersion,
+                         SearchClusterContainer.ContainerVersion targetVersion,
+                         TransferMedium medium,
+                         List<TemplateType> templateTypes) {
         try (
-            final var sourceCluster = new SearchClusterContainer(SearchClusterContainer.ES_V7_10_2);
+            final var sourceCluster = new SearchClusterContainer(sourceVersion);
             final var targetCluster = new SearchClusterContainer(targetVersion)
         ) {
-            migrateFrom_ES_v7_X(sourceCluster, targetCluster);
+            this.sourceCluster = sourceCluster;
+            this.targetCluster = targetCluster;
+            metadataCommandOnClusters(medium, MetadataCommands.EVALUATE, templateTypes);
+            metadataCommandOnClusters(medium, MetadataCommands.MIGRATE, templateTypes);
         }
     }
 
+    private enum TransferMedium {
+        SnapshotImage,
+        Http
+    }
+
+    private enum TemplateType {
+        Legacy,
+        Index,
+        IndexAndComponent
+    }
+
     @SneakyThrows
-    private void migrateFrom_ES_v7_X(
-        final SearchClusterContainer sourceCluster,
-        final SearchClusterContainer targetCluster
-    ) {
-        // ACTION: Set up the source/target clusters
-        var bothClustersStarted = CompletableFuture.allOf(
-            CompletableFuture.runAsync(() -> sourceCluster.start()),
-            CompletableFuture.runAsync(() -> targetCluster.start())
-        );
-        bothClustersStarted.join();
+    private void metadataCommandOnClusters(TransferMedium medium,
+                                           MetadataCommands command,
+                                           List<TemplateType> templateTypes) {
+        startClusters();
 
-        // Create the component and index templates
-        var sourceClusterOperations = new ClusterOperations(sourceCluster.getUrl());
-        var compoTemplateName = "simple_component_template";
-        var indexTemplateName = "simple_index_template";
-        sourceClusterOperations.createES7Templates(compoTemplateName, indexTemplateName, "author", "blog*");
+        var testData = new TestData();
 
-        // Creates a document that uses the template
-        var indexName = "blog_2023";
-        sourceClusterOperations.createDocument(indexName, "222", "{\"author\":\"Tobias Funke\"}");
+        for (TemplateType templateType : templateTypes) {
+            String uniqueSuffix = templateType.name().toLowerCase();
+            String templateName = testData.indexTemplateName + "_" + uniqueSuffix;
+            String indexPattern = "blog_" + uniqueSuffix + "_*";
+            String fieldName = "author_" + uniqueSuffix;
 
-        // ACTION: Take a snapshot
-        var snapshotContext = SnapshotTestContext.factory().noOtelTracking();
-        var snapshotName = "my_snap";
-        var sourceClient = new OpenSearchClient(ConnectionContextTestParams.builder()
-            .host(sourceCluster.getUrl())
-            .insecure(true)
-            .build()
-            .toConnectionContext());
-        var snapshotCreator = new FileSystemSnapshotCreator(
-            snapshotName,
-            sourceClient,
-            SearchClusterContainer.CLUSTER_SNAPSHOT_DIR,
-            snapshotContext.createSnapshotCreateContext()
-        );
-        SnapshotRunner.runAndWaitForCompletion(snapshotCreator);
-        sourceCluster.copySnapshotData(localDirectory.toString());
+            if (templateType == TemplateType.Legacy) {
+                sourceOperations.createLegacyTemplate(templateName, indexPattern);
+                testData.aliasNames.add("alias_legacy");
+            } else if (templateType == TemplateType.Index) {
+                sourceOperations.createIndexTemplate(templateName, fieldName, indexPattern);
+                testData.aliasNames.add("alias_index");
+            } else if (templateType == TemplateType.IndexAndComponent) {
+                String componentTemplateName = testData.compoTemplateName + "_" + uniqueSuffix;
+                sourceOperations.createComponentTemplate(componentTemplateName, templateName, fieldName, indexPattern);
+                testData.aliasNames.add("alias_component");
+                testData.componentTemplateNames.add(componentTemplateName);
+            }
+            testData.templateNames.add(templateName);
 
-        var targetArgs = new TargetArgs();
-        targetArgs.host = targetCluster.getUrl();
+            // Create documents that use the templates
+            String blogIndexName = "blog_" + uniqueSuffix + "_2023";
+            sourceOperations.createDocument(blogIndexName, "222", "{\"" + fieldName + "\":\"Tobias Funke\"}");
+            testData.blogIndexNames.add(blogIndexName);
+        }
 
-        var arguments = new MetadataArgs();
-        arguments.fileSystemRepoPath = localDirectory.getAbsolutePath();
-        arguments.snapshotName = snapshotName;
-        arguments.targetArgs = targetArgs;
-        arguments.indexAllowlist = List.of(indexName);
-        arguments.componentTemplateAllowlist = List.of(compoTemplateName);
-        arguments.indexTemplateAllowlist = List.of(indexTemplateName);
+        sourceOperations.createDocument(testData.movieIndexName, "123", "{\"title\":\"This is Spinal Tap\"}");
+        sourceOperations.createDocument(testData.indexThatAlreadyExists, "doc66", "{}");
 
-        // ACTION: Migrate the templates
-        var metadataContext = MetadataMigrationTestContext.factory().noOtelTracking();
-        var result = new MetadataMigration(arguments).migrate().execute(metadataContext);
+        sourceOperations.createAlias(testData.aliasName, "movies*");
+        testData.aliasNames.add(testData.aliasName);
 
+        var arguments = new MigrateOrEvaluateArgs();
+
+        switch (medium) {
+            case SnapshotImage:
+                var snapshotName = createSnapshot("my_snap_" + command.name().toLowerCase());
+                arguments = prepareSnapshotMigrationArgs(snapshotName);
+                break;
+
+            case Http:
+                arguments.sourceArgs.host = sourceCluster.getUrl();
+                arguments.targetArgs.host = targetCluster.getUrl();
+                break;
+        }
+
+        // Set up data filters
+        var dataFilterArgs = new DataFilterArgs();
+        dataFilterArgs.indexAllowlist = Stream.concat(testData.blogIndexNames.stream(),
+            Stream.of(testData.movieIndexName, testData.indexThatAlreadyExists)).collect(Collectors.toList());
+        dataFilterArgs.componentTemplateAllowlist = testData.componentTemplateNames;
+        dataFilterArgs.indexTemplateAllowlist = testData.templateNames;
+        arguments.dataFilterArgs = dataFilterArgs;
+
+        targetOperations.createDocument(testData.indexThatAlreadyExists, "doc77", "{}");
+
+        // Execute migration
+        MigrationItemResult result = executeMigration(arguments, command);
+
+        verifyCommandResults(result, templateTypes, testData);
+
+        verifyTargetCluster(command, templateTypes, testData);
+    }
+
+    private static class TestData {
+        final String compoTemplateName = "simple_component_template";
+        final String indexTemplateName = "simple_index_template";
+        final String aliasInTemplate = "alias1";
+        final String movieIndexName = "movies_2023";
+        final String aliasName = "movies-alias";
+        final String indexThatAlreadyExists = "already-exists";
+        final List<String> blogIndexNames = new ArrayList<>();
+        final List<String> templateNames = new ArrayList<>();
+        final List<String> componentTemplateNames = new ArrayList<>();
+        final List<String> aliasNames = new ArrayList<>();
+    }
+
+    private void verifyCommandResults(MigrationItemResult result,
+                                      List<TemplateType> templateTypes,
+                                      TestData testData) {
+        log.info(result.asCliOutput());
         assertThat(result.getExitCode(), equalTo(0));
 
+        var migratedItems = result.getItems();
+        assertThat(getNames(getSuccessfulResults(migratedItems.getIndexTemplates())),
+            containsInAnyOrder(testData.templateNames.toArray(new String[0])));
+        assertThat(getNames(getSuccessfulResults(migratedItems.getComponentTemplates())),
+            containsInAnyOrder(testData.componentTemplateNames.toArray(new String[0])));
+        assertThat(getNames(getSuccessfulResults(migratedItems.getIndexes())),
+            containsInAnyOrder(Stream.concat(testData.blogIndexNames.stream(),
+                Stream.of(testData.movieIndexName)).toArray()));
+        assertThat(getNames(getFailedResultsByType(migratedItems.getIndexes(),
+                CreationResult.CreationFailureType.ALREADY_EXISTS)),
+            containsInAnyOrder(testData.indexThatAlreadyExists));
+        assertThat(getNames(getSuccessfulResults(migratedItems.getAliases())),
+            containsInAnyOrder(testData.aliasNames.toArray(new String[0])));
+    }
+
+    private List<CreationResult> getSuccessfulResults(List<CreationResult> results) {
+        return results.stream()
+            .filter(CreationResult::wasSuccessful)
+            .collect(Collectors.toList());
+    }
+
+    private List<CreationResult> getFailedResultsByType(List<CreationResult> results, CreationResult.CreationFailureType failureType) {
+        return results.stream()
+            .filter(r -> failureType.equals(r.getFailureType()))
+            .collect(Collectors.toList());
+    }
+
+    private List<String> getNames(List<CreationResult> items) {
+        return items.stream().map(CreationResult::getName).collect(Collectors.toList());
+    }
+
+    private void verifyTargetCluster(MetadataCommands command,
+                                     List<TemplateType> templateTypes,
+                                     TestData testData) {
+        var expectUpdatesOnTarget = MetadataCommands.MIGRATE.equals(command);
+        // If the command was migrate, the target cluster should have the items, if not they shouldn't
+        var verifyResponseCode = expectUpdatesOnTarget ? equalTo(200) : equalTo(404);
+
+        // Check that the indices were migrated
+        for (String blogIndexName : testData.blogIndexNames) {
+            var res = targetOperations.get("/" + blogIndexName);
+            assertThat(res.getValue(), res.getKey(), verifyResponseCode);
+        }
+
+        var res = targetOperations.get("/" + testData.movieIndexName);
+        assertThat(res.getValue(), res.getKey(), verifyResponseCode);
+
+        res = targetOperations.get("/" + testData.aliasName);
+        assertThat(res.getValue(), res.getKey(), verifyResponseCode);
+        if (expectUpdatesOnTarget) {
+            assertThat(res.getValue(), containsString(testData.movieIndexName));
+        }
+
+        res = targetOperations.get("/_aliases");
+        assertThat(res.getValue(), res.getKey(), equalTo(200));
+        @SuppressWarnings("unchecked")
+        var verifyAliasWasListed = allOf(
+            testData.aliasNames.stream()
+                .map(Matchers::containsString)
+                .toArray(Matcher[]::new)
+        );
+        assertThat(res.getValue(), expectUpdatesOnTarget ? verifyAliasWasListed : not(verifyAliasWasListed));
+
         // Check that the templates were migrated
-        var targetClusterOperations = new ClusterOperations(targetCluster.getUrl());
-        var res = targetClusterOperations.get("/_index_template/" + indexTemplateName);
-        assertThat(res.getValue(), res.getKey(), equalTo(200));
-        assertThat(res.getValue(), Matchers.containsString("composed_of\":[\"" + compoTemplateName + "\"]"));
-
-        // Check that the index was migrated
-        res = targetClusterOperations.get("/" + indexName);
-        assertThat(res.getValue(), res.getKey(), equalTo(200));
-
-        // PSEUDO: Additional validation:
-        if (SearchClusterContainer.OS_V2_14_0.equals(targetCluster.getVersion())) {
-            // - Mapping type parameter is removed
-            // https://opensearch.org/docs/latest/breaking-changes/#remove-mapping-types-parameter
+        for (String templateName : testData.templateNames) {
+            if (templateName.contains("legacy")) {
+                res = targetOperations.get("/_template/" + templateName);
+            } else {
+                res = targetOperations.get("/_index_template/" + templateName);
+            }
+            assertThat(res.getValue(), res.getKey(), verifyResponseCode);
         }
     }
 }
